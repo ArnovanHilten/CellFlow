@@ -154,7 +154,8 @@ def main():
     print(f"  PCA done: {args.n_pca_components} components")
 
     # ── 6. Parse toml split ───────────────────────────────────────────────────
-    split_cache = os.path.join(args.data_path, args.data_name, "split_results_toml.pkl")
+    toml_stem   = Path(args.split_toml).stem if args.split_toml else "random"
+    split_cache = os.path.join(args.data_path, args.data_name, f"split_results_{toml_stem}.pkl")
     os.makedirs(os.path.dirname(split_cache), exist_ok=True)
 
     if args.split_toml and os.path.exists(split_cache):
@@ -192,7 +193,30 @@ def main():
         train_conditions = shuffled[split_idx:].tolist()
         print(f"Random split: {len(train_conditions)} train / {len(test_conditions)} test")
 
-    # ── 7. Slice adatas ───────────────────────────────────────────────────────
+    # ── 7. Pre-compute perturbation embeddings for ALL genes ──────────────────
+    # CellFlow's OneHotEncoder is fitted only on training genes, so it crashes
+    # when it sees val/test gene names. We instead provide a lookup dict covering
+    # all conditions — CellFlow skips the encoder and does a direct dict lookup.
+    #
+    # Embedding = mean PCA profile of that gene's knockdown cells (computed from
+    # the full adata before splitting). This is an INPUT representation of what
+    # each perturbation looks like, not a prediction target — the val/test splits
+    # remain fully held out for evaluation.
+    all_perturb_genes = list(set(train_conditions) | set(val_conditions) | set(test_conditions))
+    X_pca_all = adata.obsm["X_pca"]
+    cond_vals  = adata.obs["condition"].values
+    gene_emb   = {}
+    for g in all_perturb_genes:
+        mask = cond_vals == g
+        if mask.any():
+            gene_emb[g] = X_pca_all[mask].mean(axis=0).astype(np.float32)
+        else:
+            gene_emb[g] = np.zeros(args.n_pca_components, dtype=np.float32)
+    # Store in adata.uns before slicing so all subsets inherit it
+    adata.uns["gene_emb"] = gene_emb
+    print(f"  Gene embeddings: {len(gene_emb)} genes × {args.n_pca_components} dims (mean PCA profile)")
+
+    # ── 8. Slice adatas ───────────────────────────────────────────────────────
     ctrl_mask = adata.obs["is_control"]
     adata_train = adata[ctrl_mask | adata.obs["condition"].isin(train_conditions)].copy()
     adata_val   = adata[ctrl_mask | adata.obs["condition"].isin(val_conditions)].copy()
@@ -200,7 +224,7 @@ def main():
     print(f"  adata_train: {adata_train.shape}  "
           f"adata_val: {adata_val.shape}  adata_test: {adata_test.shape}")
 
-    # ── 8. CellFlow training ──────────────────────────────────────────────────
+    # ── 9. CellFlow training ──────────────────────────────────────────────────
     import optax
     import cellflow
     from cellflow.model import CellFlow
@@ -212,7 +236,7 @@ def main():
         sample_rep="X_pca",
         control_key="is_control",
         perturbation_covariates={"gene": ["condition"]},
-        perturbation_covariate_reps=None,   # one-hot fallback — sufficient for closed benchmark
+        perturbation_covariate_reps={"gene": "gene_emb"},  # dict lookup → works for val/test genes
         max_combination_length=1,
     )
 
@@ -264,7 +288,7 @@ def main():
         monitor_metrics=["val_r_squared_mean"] if val_conditions else [],
     )
 
-    # ── 9. Final evaluation on held-out TEST set ──────────────────────────────
+    # ── 10. Final evaluation on held-out TEST set ─────────────────────────────
     print("\n=== Running final evaluation on held-out TEST set ===")
     final_path = os.path.join(save_path, "final_test")
     os.makedirs(final_path, exist_ok=True)
