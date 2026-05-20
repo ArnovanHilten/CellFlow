@@ -155,7 +155,7 @@ def main():
 
     # ── 6. Parse toml split ───────────────────────────────────────────────────
     toml_stem   = Path(args.split_toml).stem if args.split_toml else "random"
-    split_cache = os.path.join(args.data_path, args.data_name, f"split_results_{toml_stem}.pkl")
+    split_cache = os.path.join(args.data_path, args.data_name, f"split_results_cellflow_{toml_stem}.pkl")
     os.makedirs(os.path.dirname(split_cache), exist_ok=True)
 
     if args.split_toml and os.path.exists(split_cache):
