@@ -295,7 +295,10 @@ def main():
 
     # Predict for each test perturbation starting from control cells
     control_cells = adata_test[adata_test.obs["is_control"]].copy()
-    covariate_df  = pd.DataFrame({"condition": test_conditions})
+    covariate_df  = pd.DataFrame({
+        "condition":  test_conditions,
+        "is_control": False,   # required by DataManager._get_condition_data
+    })
 
     predictions = cf.predict(
         adata=control_cells,
