@@ -64,6 +64,10 @@ def parse_args():
     p.add_argument("--wandb_entity",  default="", help="W&B entity (team or username)")
     p.add_argument("--wandb_tags",    default="", help="Comma-separated tags")
 
+    # Resume / eval-only
+    p.add_argument("--eval_only", action="store_true",
+                   help="Skip training; load saved CellFlow.pkl from result_path and run test eval only")
+
     return p.parse_args()
 
 
@@ -279,14 +283,20 @@ def main():
         callbacks.append(wandb_cb)
 
     # ── Train ─────────────────────────────────────────────────────────────────
-    print(f"\nTraining for {args.num_iterations} iterations (valid_freq={args.valid_freq}) …")
-    cf.train(
-        num_iterations=args.num_iterations,
-        batch_size=args.batch_size,
-        valid_freq=args.valid_freq,
-        callbacks=callbacks,
-        monitor_metrics=["val_r_squared_mean"] if val_conditions else [],
-    )
+    if args.eval_only:
+        print(f"\nSkipping training — loading saved model from {save_path} …")
+        cf = CellFlow.load(save_path)
+    else:
+        print(f"\nTraining for {args.num_iterations} iterations (valid_freq={args.valid_freq}) …")
+        cf.train(
+            num_iterations=args.num_iterations,
+            batch_size=args.batch_size,
+            valid_freq=args.valid_freq,
+            callbacks=callbacks,
+            monitor_metrics=["val_r_squared_mean"] if val_conditions else [],
+        )
+        cf.save(save_path, overwrite=True)
+        print(f"Model saved to {save_path}/CellFlow.pkl")
 
     # ── 10. Final evaluation on held-out TEST set ─────────────────────────────
     print("\n=== Running final evaluation on held-out TEST set ===")
