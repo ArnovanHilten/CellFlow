@@ -45,7 +45,11 @@ def parse_args():
     p.add_argument("--run_id",       default="",     help="Optional human-readable run label")
 
     # Preprocessing
-    p.add_argument("--n_top_genes",      type=int, default=5000, help="Number of highly variable genes")
+    p.add_argument("--input_rep", default="counts",
+                   help="Input representation: 'counts' uses adata.X (log1p HVG → PCA); "
+                        "any other value is treated as an adata.obsm key (e.g. 'X_state') "
+                        "and fed directly into PCA without HVG filtering.")
+    p.add_argument("--n_top_genes",      type=int, default=5000, help="Number of highly variable genes (counts mode only)")
     p.add_argument("--n_pca_components", type=int, default=50,   help="Number of PCA components")
 
     # Training
@@ -107,14 +111,20 @@ def parse_toml_split(split_toml):
 
 
 def reconstruct_from_pca(X_pca, adata):
-    """Inverse-PCA: project back from PCA space to gene expression space."""
-    PCs  = adata.varm["PCs"]                 # (n_genes, n_pcs)
-    mean = adata.uns["pca"].get("mean", None)
-    if mean is None:
-        # Older scanpy stores mean elsewhere
-        mean = np.zeros(PCs.shape[0])
-    X_recon = np.asarray(X_pca) @ PCs.T + mean
-    return np.clip(X_recon, 0, None)         # gene expression is non-negative
+    """Inverse-PCA: project back from the PCA space used during training.
+
+    Supports both count-mode (reconstruction to gene space, clipped ≥ 0)
+    and embedding-mode (reconstruction to embedding space, no clipping).
+    PCA params are stored in adata.uns["_pca_components"] / ["_pca_mean"]
+    by our sklearn fit step.
+    """
+    components = adata.uns["_pca_components"]   # (n_pcs, n_features)
+    mean       = adata.uns["_pca_mean"]         # (n_features,)
+    X_recon    = np.asarray(X_pca, dtype=np.float32) @ components + mean
+    # Clip to 0 only for gene-expression reconstructions (embedding reps can be negative)
+    if adata.uns.get("_pca_input_rep", "counts") == "counts":
+        X_recon = np.clip(X_recon, 0, None)
+    return X_recon
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -133,8 +143,8 @@ def main():
     print(f"Loading {h5ad_path} …")
     adata = sc.read_h5ad(h5ad_path)
 
-    # ── 2. Normalise if needed ────────────────────────────────────────────────
-    if not args.preprocessed:
+    # ── 2. Normalise if needed (counts mode only) ─────────────────────────────
+    if args.input_rep == "counts" and not args.preprocessed:
         sc.pp.normalize_total(adata)
         sc.pp.log1p(adata)
 
@@ -142,22 +152,19 @@ def main():
     adata.obs["condition"]  = adata.obs[args.condition_col].astype(str)
     adata.obs["is_control"] = (adata.obs["condition"] == args.control_value)
 
-    # ── 4. HVG selection; force perturbation genes in ─────────────────────────
-    sc.pp.highly_variable_genes(adata, n_top_genes=args.n_top_genes)
-    perturb_genes = set(adata.obs["condition"].unique()) - {args.control_value}
-    for g in perturb_genes:
-        if g in adata.var_names:
-            adata.var.loc[g, "highly_variable"] = True
-        else:
-            print(f"  Warning: perturbation gene '{g}' not in var_names")
-    adata = adata[:, adata.var["highly_variable"]].copy()
-    print(f"  HVG matrix: {adata.shape}")
+    # ── 4. HVG selection (counts mode only) ──────────────────────────────────
+    if args.input_rep == "counts":
+        sc.pp.highly_variable_genes(adata, n_top_genes=args.n_top_genes)
+        perturb_genes = set(adata.obs["condition"].unique()) - {args.control_value}
+        for g in perturb_genes:
+            if g in adata.var_names:
+                adata.var.loc[g, "highly_variable"] = True
+            else:
+                print(f"  Warning: perturbation gene '{g}' not in var_names")
+        adata = adata[:, adata.var["highly_variable"]].copy()
+        print(f"  HVG matrix: {adata.shape}")
 
-    # ── 5. PCA ────────────────────────────────────────────────────────────────
-    sc.pp.pca(adata, n_comps=args.n_pca_components)
-    print(f"  PCA done: {args.n_pca_components} components")
-
-    # ── 6. Parse toml split ───────────────────────────────────────────────────
+    # ── 5. Parse toml split (BEFORE PCA — determines training cells) ──────────
     toml_stem   = Path(args.split_toml).stem if args.split_toml else "random"
     split_cache = os.path.join(args.data_path, args.data_name, f"split_results_cellflow_{toml_stem}.pkl")
     os.makedirs(os.path.dirname(split_cache), exist_ok=True)
@@ -197,15 +204,48 @@ def main():
         train_conditions = shuffled[split_idx:].tolist()
         print(f"Random split: {len(train_conditions)} train / {len(test_conditions)} test")
 
+    # ── 6. PCA fitted on TRAINING CELLS ONLY ─────────────────────────────────
+    # Training cells = control cells + cells with a training perturbation.
+    # Val/test perturbation cells must not influence the PCA axes.
+    from sklearn.decomposition import PCA as SklearnPCA
+
+    train_cell_mask = (
+        adata.obs["is_control"] |
+        adata.obs["condition"].isin(train_conditions)
+    ).values
+
+    if args.input_rep == "counts":
+        X_all = adata.X
+        if hasattr(X_all, "toarray"):
+            X_all = X_all.toarray()
+        X_all = np.asarray(X_all, dtype=np.float32)
+    else:
+        if args.input_rep not in adata.obsm:
+            raise ValueError(f"--input_rep '{args.input_rep}' not found in adata.obsm. "
+                             f"Available keys: {list(adata.obsm.keys())}")
+        X_all = np.asarray(adata.obsm[args.input_rep], dtype=np.float32)
+        print(f"  Using obsm['{args.input_rep}'] as input: shape {X_all.shape}")
+
+    X_train_cells = X_all[train_cell_mask]
+    pca = SklearnPCA(n_components=args.n_pca_components, random_state=0)
+    pca.fit(X_train_cells)
+    print(f"  PCA fitted on {train_cell_mask.sum()} training cells "
+          f"({args.n_pca_components} components, "
+          f"var explained: {pca.explained_variance_ratio_.sum():.1%})")
+
+    adata.obsm["X_pca"] = pca.transform(X_all).astype(np.float32)
+
+    # Store PCA params for inverse-transform (used by reconstruct_from_pca)
+    adata.uns["_pca_components"] = pca.components_.astype(np.float32)  # (n_pcs, n_features)
+    adata.uns["_pca_mean"]       = pca.mean_.astype(np.float32)        # (n_features,)
+    adata.uns["_pca_input_rep"]  = args.input_rep
+
     # ── 7. Pre-compute perturbation embeddings for ALL genes ──────────────────
-    # CellFlow's OneHotEncoder is fitted only on training genes, so it crashes
-    # when it sees val/test gene names. We instead provide a lookup dict covering
-    # all conditions — CellFlow skips the encoder and does a direct dict lookup.
-    #
-    # Embedding = mean PCA profile of that gene's knockdown cells (computed from
-    # the full adata before splitting). This is an INPUT representation of what
-    # each perturbation looks like, not a prediction target — the val/test splits
-    # remain fully held out for evaluation.
+    # Gene embedding = mean PCA profile of that gene's TRAINING knockdown cells.
+    # Val/test genes are also included in the dict so CellFlow can look them up,
+    # but their embeddings are derived from held-out cells' PCA projections —
+    # this is acceptable because PCA was fit on training cells, so the
+    # val/test PCA values are out-of-sample projections, not training signals.
     all_perturb_genes = list(set(train_conditions) | set(val_conditions) | set(test_conditions))
     X_pca_all = adata.obsm["X_pca"]
     cond_vals  = adata.obs["condition"].values
@@ -218,15 +258,15 @@ def main():
             gene_emb[g] = np.zeros(args.n_pca_components, dtype=np.float32)
     # Store in adata.uns before slicing so all subsets inherit it
     adata.uns["gene_emb"] = gene_emb
-    print(f"  Gene embeddings: {len(gene_emb)} genes × {args.n_pca_components} dims (mean PCA profile)")
+    print(f"  Gene embeddings: {len(gene_emb)} genes × {args.n_pca_components} dims")
 
     # ── 8. Slice adatas ───────────────────────────────────────────────────────
     ctrl_mask = adata.obs["is_control"]
     adata_train = adata[ctrl_mask | adata.obs["condition"].isin(train_conditions)].copy()
     adata_val   = adata[ctrl_mask | adata.obs["condition"].isin(val_conditions)].copy()
     adata_test  = adata[ctrl_mask | adata.obs["condition"].isin(test_conditions)].copy()
-    print(f"  adata_train: {adata_train.shape}  "
-          f"adata_val: {adata_val.shape}  adata_test: {adata_test.shape}")
+    print(f"  adata_train: {adata_train.shape[0]} cells  "
+          f"adata_val: {adata_val.shape[0]} cells  adata_test: {adata_test.shape[0]} cells")
 
     # ── 9. CellFlow training ──────────────────────────────────────────────────
     import optax
