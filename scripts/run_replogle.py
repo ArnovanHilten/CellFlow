@@ -350,11 +350,16 @@ def main():
         "is_control": False,   # required by DataManager._get_condition_data
     })
 
+    # Note: do NOT pass condition_id_key="condition" here.
+    # When condition_id_key equals the perturbation covariate key ("condition"),
+    # _get_perturb_covar_df() promotes "condition" to the DataFrame index,
+    # removing it from the columns.  The subsequent set_index(["condition"]) then
+    # crashes with KeyError.  Omitting condition_id_key lets CellFlow identify
+    # conditions from the perturbation covariate columns directly (correct behaviour).
     predictions = cf.predict(
         adata=control_cells,
         covariate_data=covariate_df,
         sample_rep="X_pca",
-        condition_id_key="condition",
     )
     # predictions: dict {gene_name → np.ndarray (n_cells, n_pca)}
 
