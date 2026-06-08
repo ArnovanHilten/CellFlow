@@ -143,6 +143,31 @@ def main():
     print(f"Loading {h5ad_path} …")
     adata = sc.read_h5ad(h5ad_path)
 
+    # ── 1b. Cell-line filter — toml split is cell-line-specific ──────────────
+    # The STATE toml uses keys like "replogle.k562", meaning the held-out gene
+    # lists only apply to K562 cells.  If the h5ad contains multiple cell lines
+    # (e.g. jurkat, rpe1, hepg2 in addition to k562), we must subset to the
+    # target cell line BEFORE applying the toml split; otherwise non-k562 cells
+    # with k562-test genes are wrongly excluded from training.
+    if args.split_toml and "cell_line" in adata.obs.columns:
+        # Infer the target cell line from the toml key (e.g. "replogle.k562" → "k562")
+        import tomllib as _tomllib
+        with open(args.split_toml, "rb") as _f:
+            _toml = _tomllib.load(_f)
+        _fewshot_keys = list(_toml.get("fewshot", {}).keys())  # e.g. ["replogle.k562"]
+        _cell_lines_in_toml = {k.split(".")[-1] for k in _fewshot_keys}   # {"k562"}
+        _avail = set(adata.obs["cell_line"].unique())
+        _matched = _cell_lines_in_toml & _avail
+        if _matched:
+            _target = sorted(_matched)[0]   # use the first match (typically only one)
+            n_before = adata.n_obs
+            adata = adata[adata.obs["cell_line"] == _target].copy()
+            print(f"  Cell-line filter: kept '{_target}' cells "
+                  f"({adata.n_obs:,} / {n_before:,})")
+        else:
+            print(f"  Warning: toml cell lines {_cell_lines_in_toml} not found in "
+                  f"adata.obs['cell_line'] ({_avail}); skipping cell-line filter")
+
     # ── 2. Normalise if needed (counts mode only) ─────────────────────────────
     if args.input_rep == "counts" and not args.preprocessed:
         sc.pp.normalize_total(adata)
