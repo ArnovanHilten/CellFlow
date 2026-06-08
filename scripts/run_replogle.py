@@ -111,20 +111,26 @@ def parse_toml_split(split_toml):
 
 
 def reconstruct_from_pca(X_pca, adata):
-    """Inverse-PCA: project back from the PCA space used during training.
+    """Map from PCA space back to gene expression space.
 
-    Supports both count-mode (reconstruction to gene space, clipped ≥ 0)
-    and embedding-mode (reconstruction to embedding space, no clipping).
-    PCA params are stored in adata.uns["_pca_components"] / ["_pca_mean"]
-    by our sklearn fit step.
+    counts mode  — PCA was fit on HVG expression.
+                   Inverse: X_pca @ components + mean, clipped ≥ 0.
+    embedding mode (X_state, …) — PCA was fit on embedding space.
+                   A linear decoder (Ridge) was trained on training cells to map
+                   X_pca → gene expression directly, bypassing the embedding
+                   reconstruction (which would give ~2048-dim embedding vectors,
+                   not gene expression).  Stored in adata.uns["_decoder_coef"].
     """
-    components = adata.uns["_pca_components"]   # (n_pcs, n_features)
-    mean       = adata.uns["_pca_mean"]         # (n_features,)
-    X_recon    = np.asarray(X_pca, dtype=np.float32) @ components + mean
-    # Clip to 0 only for gene-expression reconstructions (embedding reps can be negative)
     if adata.uns.get("_pca_input_rep", "counts") == "counts":
-        X_recon = np.clip(X_recon, 0, None)
-    return X_recon
+        components = adata.uns["_pca_components"]   # (n_pcs, n_genes_hvg)
+        mean       = adata.uns["_pca_mean"]         # (n_genes_hvg,)
+        X_recon    = np.asarray(X_pca, dtype=np.float32) @ components + mean
+        return np.clip(X_recon, 0, None)
+    else:
+        # Linear decoder: X_pca → gene expression (fitted on training cells)
+        coef      = adata.uns["_decoder_coef"]        # (n_genes, n_pcs)
+        intercept = adata.uns["_decoder_intercept"]   # (n_genes,)
+        return np.asarray(X_pca, dtype=np.float32) @ coef.T + intercept
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -265,6 +271,37 @@ def main():
     adata.uns["_pca_mean"]       = pca.mean_.astype(np.float32)        # (n_features,)
     adata.uns["_pca_input_rep"]  = args.input_rep
 
+    # ── 6b. Linear decoder: X_pca → gene expression (embedding modes only) ───
+    # For counts mode, gene expression is recovered by PCA inverse.
+    # For embedding modes (X_state, …), the PCA space is over ~2048-dim
+    # embeddings — not gene expression.  A ridge regression is fitted from the
+    # 50-dim PCA coordinates to log-normalised gene expression on training cells
+    # so that predictions can be evaluated in gene expression space alongside
+    # scDFM.  The decoder uses only training cells (no data leakage).
+    if args.input_rep != "counts":
+        from sklearn.linear_model import Ridge
+
+        X_pca_tr  = adata.obsm["X_pca"][train_cell_mask]   # (n_tr, n_pcs)
+        Y_gene_tr = adata.X[train_cell_mask]
+        if hasattr(Y_gene_tr, "toarray"):
+            Y_gene_tr = Y_gene_tr.toarray()
+        Y_gene_tr = np.asarray(Y_gene_tr, dtype=np.float32)
+
+        print(f"  Fitting linear decoder: "
+              f"X_pca({args.n_pca_components}) → genes({Y_gene_tr.shape[1]}) "
+              f"on {train_cell_mask.sum():,} training cells …")
+        decoder = Ridge(alpha=1.0)
+        decoder.fit(X_pca_tr, Y_gene_tr)
+
+        adata.uns["_decoder_coef"]      = decoder.coef_.astype(np.float32)   # (n_genes, n_pcs)
+        adata.uns["_decoder_intercept"] = decoder.intercept_.astype(np.float32)
+
+        # Quick in-sample R² as a sanity check (expected to be moderate, not perfect)
+        Y_hat  = X_pca_tr @ decoder.coef_.T + decoder.intercept_
+        ss_res = float(((Y_gene_tr - Y_hat) ** 2).sum())
+        ss_tot = float(((Y_gene_tr - Y_gene_tr.mean(0)) ** 2).sum())
+        print(f"  Decoder in-sample R²: {1 - ss_res / ss_tot:.4f}")
+
     # ── 7. Pre-compute perturbation embeddings for ALL genes ──────────────────
     # Gene embedding = mean PCA profile of that gene's TRAINING knockdown cells.
     # Val/test genes are also included in the dict so CellFlow can look them up,
@@ -392,12 +429,18 @@ def main():
     all_pred_expr, obs_pred_names = [], []
     all_real_expr, obs_real_names = [], []
 
-    # Control baseline (same for all evaluators)
-    ctrl_gene_expr = reconstruct_from_pca(control_cells.obsm["X_pca"], adata)
-    all_pred_expr.append(ctrl_gene_expr)
-    all_real_expr.append(ctrl_gene_expr)
-    obs_pred_names.extend(["control"] * ctrl_gene_expr.shape[0])
-    obs_real_names.extend(["control"] * ctrl_gene_expr.shape[0])
+    # Control baseline
+    # pred: decoded from the PCA coordinates that CellFlow uses as source
+    # real: actual gene expression from adata.X (ground truth)
+    ctrl_pred_expr = reconstruct_from_pca(control_cells.obsm["X_pca"], adata)
+    ctrl_real_expr = np.asarray(
+        control_cells.X.toarray() if hasattr(control_cells.X, "toarray")
+        else control_cells.X
+    )
+    all_pred_expr.append(ctrl_pred_expr)
+    all_real_expr.append(ctrl_real_expr)
+    obs_pred_names.extend(["control"] * ctrl_pred_expr.shape[0])
+    obs_real_names.extend(["control"] * ctrl_real_expr.shape[0])
 
     skipped = []
     for cond in test_conditions:
