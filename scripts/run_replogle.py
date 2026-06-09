@@ -117,6 +117,113 @@ def parse_toml_split(split_toml):
     return val_genes, test_genes
 
 
+# ── Inline STATE decoder (no STATE package required) ─────────────────────────
+# LatentToGeneDecoder is copied verbatim from
+#   github.com/ArcInstitute/state  src/state/tx/models/base.py
+# so that we can load STATE checkpoint weights without installing the full
+# `arc-state` package (which would create dependency conflicts with CellFlow).
+
+import torch
+import torch.nn as nn
+from typing import List as _List
+
+
+class LatentToGeneDecoder(nn.Module):
+    """MLP that maps latent embeddings (output_dim of STATE) to gene expression.
+
+    Copied from ArcInstitute/state src/state/tx/models/base.py.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        gene_dim: int,
+        hidden_dims: _List[int] = (512, 1024),
+        dropout: float = 0.1,
+        residual_decoder: bool = False,
+    ):
+        super().__init__()
+        self.residual_decoder = residual_decoder
+
+        if residual_decoder:
+            self.blocks = nn.ModuleList()
+            in_dim = latent_dim
+            for h in hidden_dims:
+                self.blocks.append(nn.Sequential(
+                    nn.Linear(in_dim, h), nn.LayerNorm(h), nn.GELU(), nn.Dropout(dropout)
+                ))
+                in_dim = h
+            self.final_layer = nn.Sequential(nn.Linear(in_dim, gene_dim), nn.ReLU())
+        else:
+            layers, in_dim = [], latent_dim
+            for h in hidden_dims:
+                layers += [nn.Linear(in_dim, h), nn.LayerNorm(h), nn.GELU(), nn.Dropout(dropout)]
+                in_dim = h
+            layers += [nn.Linear(in_dim, gene_dim), nn.ReLU()]
+            self.decoder = nn.Sequential(*layers)
+
+    def n_output_genes(self):
+        if self.residual_decoder:
+            return self.final_layer[0].out_features
+        for m in reversed(self.decoder):
+            if isinstance(m, nn.Linear):
+                return m.out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.residual_decoder:
+            outs, cur = [], x
+            for i, block in enumerate(self.blocks):
+                out = block(cur)
+                if i >= 1 and i % 2 == 1:
+                    out = out + outs[i - 1]
+                outs.append(out)
+                cur = out
+            return self.final_layer(cur)
+        return self.decoder(x)
+
+
+def load_state_decoder(checkpoint_path: str):
+    """Load only the LatentToGeneDecoder from a STATE .ckpt checkpoint.
+
+    Does NOT require the `arc-state` package — uses plain torch.load.
+
+    Returns
+    -------
+    decoder : LatentToGeneDecoder (eval mode, CPU)
+    gene_names : list[str] | None
+    """
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    hparams = ckpt.get("hyper_parameters", {})
+
+    decoder_cfg = hparams.get("decoder_cfg")
+    if not decoder_cfg:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} has no 'decoder_cfg' in hyper_parameters. "
+            "The STATE model was likely trained with gene_decoder_bool=False or "
+            "output_space='embedding'. Re-train with output_space='gene'."
+        )
+
+    decoder = LatentToGeneDecoder(**decoder_cfg)
+
+    # Extract just the gene_decoder.* keys from the full state_dict
+    prefix = "gene_decoder."
+    decoder_sd = {
+        k[len(prefix):]: v
+        for k, v in ckpt["state_dict"].items()
+        if k.startswith(prefix)
+    }
+    if not decoder_sd:
+        raise RuntimeError(
+            f"No 'gene_decoder.*' keys found in checkpoint state_dict. "
+            "Keys present: " + str([k for k in ckpt["state_dict"] if "decoder" in k])
+        )
+    decoder.load_state_dict(decoder_sd)
+    decoder.eval()
+
+    gene_names = hparams.get("gene_names")  # list[str] | None
+    return decoder, gene_names
+
+
 def reconstruct_from_pca(X_pca, adata, state_decoder=None, state_decoder_gene_idx=None):
     """Map from PCA space back to gene expression space.
 
@@ -143,7 +250,6 @@ def reconstruct_from_pca(X_pca, adata, state_decoder=None, state_decoder_gene_id
 
     elif state_decoder is not None:
         # ── STATE decoder: PCA inverse → X_state → gene expression ───────────
-        import torch
         components = adata.uns["_pca_components"]   # (n_pcs, embedding_dim)
         mean       = adata.uns["_pca_mean"]         # (embedding_dim,)
         X_emb      = np.asarray(X_pca, dtype=np.float32) @ components + mean  # (n, embedding_dim)
@@ -312,29 +418,12 @@ def main():
     if args.input_rep != "counts":
         if args.state_checkpoint:
             # ── STATE decoder (preferred) ─────────────────────────────────────
+            # Loaded with plain torch.load — no `arc-state` package needed.
             try:
-                import torch
-                from state.tx.models.state_transition import StateTransitionPerturbationModel
+                print(f"  Loading STATE decoder from: {args.state_checkpoint} …")
+                state_decoder, decoder_gene_names = load_state_decoder(args.state_checkpoint)
 
-                print(f"  Loading STATE checkpoint: {args.state_checkpoint} …")
-                state_model = StateTransitionPerturbationModel.load_from_checkpoint(
-                    args.state_checkpoint, map_location="cpu"
-                )
-                state_model.eval()
-
-                if state_model.gene_decoder is None:
-                    raise RuntimeError(
-                        "STATE model loaded but gene_decoder is None "
-                        "(gene_decoder_bool=False or output_space='embedding'). "
-                        "Re-train STATE with gene_decoder_bool=True and output_space='gene'."
-                    )
-
-                state_decoder = state_model.gene_decoder
-                decoder_gene_names = state_model.gene_names  # list[str] | None
-
-                # Build an index that reorders the decoder's output genes to match
-                # adata.var_names (they should be the same set, just potentially in
-                # a different order).
+                # Align decoder output genes to adata.var order
                 adata_genes = list(adata.var_names)
                 if decoder_gene_names is not None and list(decoder_gene_names) != adata_genes:
                     gene_to_idx = {g: i for i, g in enumerate(decoder_gene_names)}
@@ -346,13 +435,12 @@ def main():
                               f"adata has {len(adata_genes)} genes.")
                     except KeyError as missing:
                         raise RuntimeError(
-                            f"Gene {missing} is in adata.var_names but not in the STATE decoder's "
-                            f"gene_names.  The checkpoint may have been trained on a different gene set."
+                            f"Gene {missing} is in adata.var_names but not in the STATE "
+                            f"decoder's gene_names. The checkpoint may use a different gene set."
                         )
 
-                print(f"  STATE LatentToGeneDecoder ready: "
-                      f"input {state_model.output_dim}-dim → "
-                      f"{state_decoder.gene_dim()} genes")
+                n_genes = state_decoder.n_output_genes()
+                print(f"  STATE LatentToGeneDecoder ready: → {n_genes} genes")
 
             except Exception as e:
                 print(f"  Warning: STATE decoder loading failed ({e}). "
