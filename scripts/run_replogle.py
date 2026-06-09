@@ -72,6 +72,13 @@ def parse_args():
     p.add_argument("--eval_only", action="store_true",
                    help="Skip training; load saved CellFlow.pkl from result_path and run test eval only")
 
+    # Decoder (embedding modes only)
+    p.add_argument("--state_checkpoint", default="",
+                   help="Path to a trained STATE model checkpoint (.ckpt).  When --input_rep is an "
+                        "embedding key (e.g. X_state), the STATE LatentToGeneDecoder extracted from "
+                        "this checkpoint is used to map predicted embeddings → gene expression.  "
+                        "If omitted, falls back to a Ridge regression fitted on training cells.")
+
     return p.parse_args()
 
 
@@ -110,24 +117,45 @@ def parse_toml_split(split_toml):
     return val_genes, test_genes
 
 
-def reconstruct_from_pca(X_pca, adata):
+def reconstruct_from_pca(X_pca, adata, state_decoder=None, state_decoder_gene_idx=None):
     """Map from PCA space back to gene expression space.
+
+    Three modes depending on how training was configured:
 
     counts mode  — PCA was fit on HVG expression.
                    Inverse: X_pca @ components + mean, clipped ≥ 0.
-    embedding mode (X_state, …) — PCA was fit on embedding space.
-                   A linear decoder (Ridge) was trained on training cells to map
-                   X_pca → gene expression directly, bypassing the embedding
-                   reconstruction (which would give ~2048-dim embedding vectors,
-                   not gene expression).  Stored in adata.uns["_decoder_coef"].
+
+    STATE decoder — PCA was fit on X_state embeddings.
+                   Step 1: PCA inverse → X_state  (output_dim of STATE = input_dim = 2048)
+                   Step 2: STATE LatentToGeneDecoder(X_state) → gene expression
+                   `state_decoder` is the nn.Module; `state_decoder_gene_idx` is an
+                   optional integer index array to reorder decoder output to match adata.var order.
+
+    Ridge fallback — PCA was fit on X_state (no STATE checkpoint given).
+                   Linear map stored in adata.uns["_decoder_coef"]: X_pca → gene expression.
     """
     if adata.uns.get("_pca_input_rep", "counts") == "counts":
+        # ── counts mode: PCA inverse → HVG counts ────────────────────────────
         components = adata.uns["_pca_components"]   # (n_pcs, n_genes_hvg)
         mean       = adata.uns["_pca_mean"]         # (n_genes_hvg,)
         X_recon    = np.asarray(X_pca, dtype=np.float32) @ components + mean
         return np.clip(X_recon, 0, None)
+
+    elif state_decoder is not None:
+        # ── STATE decoder: PCA inverse → X_state → gene expression ───────────
+        import torch
+        components = adata.uns["_pca_components"]   # (n_pcs, embedding_dim)
+        mean       = adata.uns["_pca_mean"]         # (embedding_dim,)
+        X_emb      = np.asarray(X_pca, dtype=np.float32) @ components + mean  # (n, embedding_dim)
+        with torch.no_grad():
+            gene_pred = state_decoder(torch.from_numpy(X_emb)).cpu().numpy()   # (n, decoder_gene_dim)
+        # Reorder to match adata.var order if needed
+        if state_decoder_gene_idx is not None:
+            gene_pred = gene_pred[:, state_decoder_gene_idx]
+        return gene_pred
+
     else:
-        # Linear decoder: X_pca → gene expression (fitted on training cells)
+        # ── Ridge fallback: X_pca → gene expression (linear, stored in uns) ──
         coef      = adata.uns["_decoder_coef"]        # (n_genes, n_pcs)
         intercept = adata.uns["_decoder_intercept"]   # (n_genes,)
         return np.asarray(X_pca, dtype=np.float32) @ coef.T + intercept
@@ -274,33 +302,86 @@ def main():
     # ── 6b. Linear decoder: X_pca → gene expression (embedding modes only) ───
     # For counts mode, gene expression is recovered by PCA inverse.
     # For embedding modes (X_state, …), the PCA space is over ~2048-dim
-    # embeddings — not gene expression.  A ridge regression is fitted from the
-    # 50-dim PCA coordinates to log-normalised gene expression on training cells
-    # so that predictions can be evaluated in gene expression space alongside
-    # scDFM.  The decoder uses only training cells (no data leakage).
+    # embeddings — not gene expression.  We prefer the trained STATE
+    # LatentToGeneDecoder (an MLP already trained on the same corpus).  If no
+    # STATE checkpoint is supplied, we fall back to a Ridge regression fitted on
+    # training cells as a linear approximation.
+    state_decoder          = None   # nn.Module or None
+    state_decoder_gene_idx = None   # index array to reorder decoder output → adata.var order
+
     if args.input_rep != "counts":
-        from sklearn.linear_model import Ridge
+        if args.state_checkpoint:
+            # ── STATE decoder (preferred) ─────────────────────────────────────
+            try:
+                import torch
+                from state.tx.models.state_transition import StateTransitionPerturbationModel
 
-        X_pca_tr  = adata.obsm["X_pca"][train_cell_mask]   # (n_tr, n_pcs)
-        Y_gene_tr = adata.X[train_cell_mask]
-        if hasattr(Y_gene_tr, "toarray"):
-            Y_gene_tr = Y_gene_tr.toarray()
-        Y_gene_tr = np.asarray(Y_gene_tr, dtype=np.float32)
+                print(f"  Loading STATE checkpoint: {args.state_checkpoint} …")
+                state_model = StateTransitionPerturbationModel.load_from_checkpoint(
+                    args.state_checkpoint, map_location="cpu"
+                )
+                state_model.eval()
 
-        print(f"  Fitting linear decoder: "
-              f"X_pca({args.n_pca_components}) → genes({Y_gene_tr.shape[1]}) "
-              f"on {train_cell_mask.sum():,} training cells …")
-        decoder = Ridge(alpha=1.0)
-        decoder.fit(X_pca_tr, Y_gene_tr)
+                if state_model.gene_decoder is None:
+                    raise RuntimeError(
+                        "STATE model loaded but gene_decoder is None "
+                        "(gene_decoder_bool=False or output_space='embedding'). "
+                        "Re-train STATE with gene_decoder_bool=True and output_space='gene'."
+                    )
 
-        adata.uns["_decoder_coef"]      = decoder.coef_.astype(np.float32)   # (n_genes, n_pcs)
-        adata.uns["_decoder_intercept"] = decoder.intercept_.astype(np.float32)
+                state_decoder = state_model.gene_decoder
+                decoder_gene_names = state_model.gene_names  # list[str] | None
 
-        # Quick in-sample R² as a sanity check (expected to be moderate, not perfect)
-        Y_hat  = X_pca_tr @ decoder.coef_.T + decoder.intercept_
-        ss_res = float(((Y_gene_tr - Y_hat) ** 2).sum())
-        ss_tot = float(((Y_gene_tr - Y_gene_tr.mean(0)) ** 2).sum())
-        print(f"  Decoder in-sample R²: {1 - ss_res / ss_tot:.4f}")
+                # Build an index that reorders the decoder's output genes to match
+                # adata.var_names (they should be the same set, just potentially in
+                # a different order).
+                adata_genes = list(adata.var_names)
+                if decoder_gene_names is not None and list(decoder_gene_names) != adata_genes:
+                    gene_to_idx = {g: i for i, g in enumerate(decoder_gene_names)}
+                    try:
+                        state_decoder_gene_idx = np.array(
+                            [gene_to_idx[g] for g in adata_genes], dtype=np.int64
+                        )
+                        print(f"  Gene order remapped: decoder has {len(decoder_gene_names)} genes, "
+                              f"adata has {len(adata_genes)} genes.")
+                    except KeyError as missing:
+                        raise RuntimeError(
+                            f"Gene {missing} is in adata.var_names but not in the STATE decoder's "
+                            f"gene_names.  The checkpoint may have been trained on a different gene set."
+                        )
+
+                print(f"  STATE LatentToGeneDecoder ready: "
+                      f"input {state_model.output_dim}-dim → "
+                      f"{state_decoder.gene_dim()} genes")
+
+            except Exception as e:
+                print(f"  Warning: STATE decoder loading failed ({e}). "
+                      f"Falling back to Ridge regression.")
+                state_decoder = None
+
+        if state_decoder is None:
+            # ── Ridge fallback ────────────────────────────────────────────────
+            from sklearn.linear_model import Ridge
+
+            X_pca_tr  = adata.obsm["X_pca"][train_cell_mask]   # (n_tr, n_pcs)
+            Y_gene_tr = adata.X[train_cell_mask]
+            if hasattr(Y_gene_tr, "toarray"):
+                Y_gene_tr = Y_gene_tr.toarray()
+            Y_gene_tr = np.asarray(Y_gene_tr, dtype=np.float32)
+
+            print(f"  Fitting Ridge decoder: "
+                  f"X_pca({args.n_pca_components}) → genes({Y_gene_tr.shape[1]}) "
+                  f"on {train_cell_mask.sum():,} training cells …")
+            ridge = Ridge(alpha=1.0)
+            ridge.fit(X_pca_tr, Y_gene_tr)
+
+            adata.uns["_decoder_coef"]      = ridge.coef_.astype(np.float32)
+            adata.uns["_decoder_intercept"] = ridge.intercept_.astype(np.float32)
+
+            Y_hat  = X_pca_tr @ ridge.coef_.T + ridge.intercept_
+            ss_res = float(((Y_gene_tr - Y_hat) ** 2).sum())
+            ss_tot = float(((Y_gene_tr - Y_gene_tr.mean(0)) ** 2).sum())
+            print(f"  Ridge in-sample R²: {1 - ss_res / ss_tot:.4f}")
 
     # ── 7. Pre-compute perturbation embeddings for ALL genes ──────────────────
     # Gene embedding = mean PCA profile of that gene's TRAINING knockdown cells.
@@ -429,10 +510,18 @@ def main():
     all_pred_expr, obs_pred_names = [], []
     all_real_expr, obs_real_names = [], []
 
+    # Shorthand so we don't repeat kwargs at every call site
+    def _decode(X_pca):
+        return reconstruct_from_pca(
+            X_pca, adata,
+            state_decoder=state_decoder,
+            state_decoder_gene_idx=state_decoder_gene_idx,
+        )
+
     # Control baseline
     # pred: decoded from the PCA coordinates that CellFlow uses as source
     # real: actual gene expression from adata.X (ground truth)
-    ctrl_pred_expr = reconstruct_from_pca(control_cells.obsm["X_pca"], adata)
+    ctrl_pred_expr = _decode(control_cells.obsm["X_pca"])
     ctrl_real_expr = np.asarray(
         control_cells.X.toarray() if hasattr(control_cells.X, "toarray")
         else control_cells.X
@@ -447,8 +536,8 @@ def main():
         if cond not in predictions:
             skipped.append(cond)
             continue
-        pred_pca  = predictions[cond]                          # (n_cells, n_pca)
-        pred_gene = reconstruct_from_pca(pred_pca, adata)     # (n_cells, n_genes)
+        pred_pca  = predictions[cond]      # (n_cells, n_pca)
+        pred_gene = _decode(pred_pca)      # (n_cells, n_genes)
 
         # Ground-truth perturbed cells
         real_cells = adata_test[adata_test.obs["condition"] == cond]
