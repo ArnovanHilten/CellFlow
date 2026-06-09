@@ -423,21 +423,31 @@ def main():
                 print(f"  Loading STATE decoder from: {args.state_checkpoint} …")
                 state_decoder, decoder_gene_names = load_state_decoder(args.state_checkpoint)
 
-                # Align decoder output genes to adata.var order
-                adata_genes = list(adata.var_names)
-                if decoder_gene_names is not None and list(decoder_gene_names) != adata_genes:
-                    gene_to_idx = {g: i for i, g in enumerate(decoder_gene_names)}
-                    try:
-                        state_decoder_gene_idx = np.array(
-                            [gene_to_idx[g] for g in adata_genes], dtype=np.int64
-                        )
-                        print(f"  Gene order remapped: decoder has {len(decoder_gene_names)} genes, "
-                              f"adata has {len(adata_genes)} genes.")
-                    except KeyError as missing:
-                        raise RuntimeError(
-                            f"Gene {missing} is in adata.var_names but not in the STATE "
-                            f"decoder's gene_names. The checkpoint may use a different gene set."
-                        )
+                # Align decoder output genes to adata.var order.
+                # The decoder predicts a fixed gene set (gene_dim=2000); adata may have
+                # far more genes.  We take the intersection and subset adata so that
+                # adata.X (ground truth) and decoder output are on the same gene set.
+                if decoder_gene_names is not None:
+                    decoder_gene_set  = set(decoder_gene_names)
+                    adata_gene_set    = set(adata.var_names)
+                    n_missing_in_adata = len(decoder_gene_set - adata_gene_set)
+                    if n_missing_in_adata:
+                        print(f"  {n_missing_in_adata} decoder genes absent from adata.var (will be ignored)")
+
+                    # Keep intersection, in adata.var order for consistent slicing
+                    genes_in_adata_order = [g for g in adata.var_names if g in decoder_gene_set]
+                    print(f"  Evaluating on {len(genes_in_adata_order)} overlapping genes "
+                          f"(decoder has {len(decoder_gene_names)}, adata had {adata.n_vars})")
+
+                    # For each overlapping gene (in adata.var order), its column in decoder output
+                    gene_to_decoder_idx = {g: i for i, g in enumerate(decoder_gene_names)}
+                    state_decoder_gene_idx = np.array(
+                        [gene_to_decoder_idx[g] for g in genes_in_adata_order], dtype=np.int64
+                    )
+
+                    # Subset adata to decoder genes so adata.X aligns with predictions.
+                    # Steps 7 & 8 run after this block, so all slices inherit the subset.
+                    adata = adata[:, genes_in_adata_order].copy()
 
                 n_genes = state_decoder.n_output_genes()
                 print(f"  STATE LatentToGeneDecoder ready: → {n_genes} genes")
