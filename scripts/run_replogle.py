@@ -667,7 +667,6 @@ def main():
             control_pert="control",
             pert_col="perturbation",
             num_threads=8,
-            out_dir=final_path,
         )
         results, agg_results = evaluator.compute()
         results.write_csv(os.path.join(final_path, "results.csv"))
