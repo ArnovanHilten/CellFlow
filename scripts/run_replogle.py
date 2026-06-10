@@ -587,22 +587,23 @@ def main():
     # Predict for each test perturbation starting from control cells
     control_cells = adata_test[adata_test.obs["is_control"]].copy()
     covariate_df  = pd.DataFrame({
-        "condition":  test_conditions,
-        "is_control": False,   # required by DataManager._get_condition_data
+        "condition":     test_conditions,
+        "is_control":    False,
+        # condition_name is a separate ID column — must differ from the perturbation
+        # covariate key ("condition") so that _get_perturb_covar_df does not consume
+        # it as the index before CellFlow can use it as a condition identifier.
+        # With condition_id_key="condition_name", predictions is keyed by the gene
+        # name strings (e.g. "BRCA1") rather than by tuples (e.g. ("BRCA1",)).
+        "condition_name": test_conditions,
     })
 
-    # Note: do NOT pass condition_id_key="condition" here.
-    # When condition_id_key equals the perturbation covariate key ("condition"),
-    # _get_perturb_covar_df() promotes "condition" to the DataFrame index,
-    # removing it from the columns.  The subsequent set_index(["condition"]) then
-    # crashes with KeyError.  Omitting condition_id_key lets CellFlow identify
-    # conditions from the perturbation covariate columns directly (correct behaviour).
     predictions = cf.predict(
         adata=control_cells,
         covariate_data=covariate_df,
         sample_rep="X_pca",
+        condition_id_key="condition_name",
     )
-    # predictions: dict {gene_name → np.ndarray (n_cells, n_pca)}
+    # predictions: dict {gene_name_str → np.ndarray (n_cells, n_pca)}
 
     # Reconstruct from PCA → gene expression space
     all_pred_expr, obs_pred_names = [], []
