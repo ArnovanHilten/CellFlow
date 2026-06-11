@@ -671,9 +671,10 @@ def main():
         results, agg_results = evaluator.compute()
         results.write_csv(os.path.join(final_path, "results.csv"))
         agg_results.write_csv(os.path.join(final_path, "agg_results.csv"))
-        agg_dict = agg_results.to_pandas().iloc[0].to_dict()
-        print("Test set metrics:")
-        for k, v in agg_dict.items():
+        agg_df = agg_results.to_pandas()
+        mean_row = agg_df[agg_df["statistic"] == "mean"].iloc[0].to_dict()
+        print("Test set metrics (mean across perturbations):")
+        for k, v in mean_row.items():
             if isinstance(v, float):
                 print(f"  {k}: {v:.4f}")
 
@@ -681,7 +682,7 @@ def main():
         if wandb_cb is not None:
             import wandb
             if wandb.run is not None:
-                wandb.log({f"test/{k}": v for k, v in agg_dict.items()
+                wandb.log({f"test/{k}": v for k, v in mean_row.items()
                            if isinstance(v, (int, float))})
     except Exception as e:
         print(f"Warning: cell-eval failed ({e}). Skipping final metrics computation.")
