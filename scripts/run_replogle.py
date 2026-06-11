@@ -658,27 +658,52 @@ def main():
     pred_adata.write_h5ad(os.path.join(final_path, "pred.h5ad"))
     real_adata.write_h5ad(os.path.join(final_path, "real.h5ad"))
 
-    # cell-eval metrics (same evaluator as scDFM)
+    # cell-eval metrics — run in a subprocess so pdex can fork freely.
+    # JAX is multithreaded; os.fork() after JAX starts causes a deadlock in
+    # pdex's worker pool.  A fresh subprocess has no JAX threads → no deadlock.
     try:
-        from cell_eval import MetricsEvaluator
-        evaluator = MetricsEvaluator(
-            adata_pred=pred_adata,
-            adata_real=real_adata,
-            control_pert="control",
-            pert_col="perturbation",
-            num_threads=8,
+        import subprocess, sys, json as _json
+
+        pred_path    = os.path.join(final_path, "pred.h5ad")
+        real_path    = os.path.join(final_path, "real.h5ad")
+        results_csv  = os.path.join(final_path, "results.csv")
+        agg_csv      = os.path.join(final_path, "agg_results.csv")
+
+        eval_script = f"""
+import anndata as ad, json, pandas as pd
+from cell_eval import MetricsEvaluator
+
+pred = ad.read_h5ad({_json.dumps(pred_path)})
+real = ad.read_h5ad({_json.dumps(real_path)})
+evaluator = MetricsEvaluator(
+    adata_pred=pred, adata_real=real,
+    control_pert="control", pert_col="perturbation", num_threads=8,
+)
+results, agg = evaluator.compute()
+results.write_csv({_json.dumps(results_csv)})
+agg.write_csv({_json.dumps(agg_csv)})
+agg_df = agg.to_pandas()
+mean_row = agg_df[agg_df["statistic"] == "mean"].iloc[0].to_dict()
+print(json.dumps({{k: v for k, v in mean_row.items() if isinstance(v, float)}}))
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", eval_script],
+            capture_output=False,   # stream stdout/stderr directly to the log
+            text=True,
         )
-        results, agg_results = evaluator.compute()
-        results.write_csv(os.path.join(final_path, "results.csv"))
-        agg_results.write_csv(os.path.join(final_path, "agg_results.csv"))
-        agg_df = agg_results.to_pandas()
+        if proc.returncode != 0:
+            raise RuntimeError(f"cell-eval subprocess exited with code {proc.returncode}")
+
+        # Read back mean metrics from the written CSV
+        import pandas as _pd
+        agg_df   = _pd.read_csv(agg_csv)
         mean_row = agg_df[agg_df["statistic"] == "mean"].iloc[0].to_dict()
         print("Test set metrics (mean across perturbations):")
         for k, v in mean_row.items():
             if isinstance(v, float):
                 print(f"  {k}: {v:.4f}")
 
-        # Log test metrics to W&B
+        # Log to W&B
         if wandb_cb is not None:
             import wandb
             if wandb.run is not None:
