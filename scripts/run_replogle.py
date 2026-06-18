@@ -391,6 +391,20 @@ def main():
         X_all = np.asarray(adata.obsm[args.input_rep], dtype=np.float32)
         print(f"  Using obsm['{args.input_rep}'] as input: shape {X_all.shape}")
 
+    # ── NaN/Inf audit & fix ──────────────────────────────────────────────────
+    # Apply unconditionally: NaN or Inf in the input representation propagate
+    # through PCA → gene_emb → condition encoder → loss as NaN.
+    bad_mask = ~np.isfinite(X_all)
+    n_bad_cells = bad_mask.any(axis=1).sum()
+    if n_bad_cells > 0:
+        print(f"  WARNING: {n_bad_cells} cells have NaN/Inf in '{args.input_rep}' "
+              f"({bad_mask.sum()} total bad values) — replacing with 0.")
+    X_all = np.nan_to_num(X_all, nan=0.0, posinf=0.0, neginf=0.0)
+    if args.input_rep != "counts":
+        adata.obsm[args.input_rep] = X_all
+    # counts mode: X_all was already densified; adata.X not updated
+    # (PCA operates on X_all directly, adata.X not needed after this)
+
     X_train_cells = X_all[train_cell_mask]
     pca = SklearnPCA(n_components=args.n_pca_components, random_state=0)
     pca.fit(X_train_cells)
@@ -398,7 +412,12 @@ def main():
           f"({args.n_pca_components} components, "
           f"var explained: {pca.explained_variance_ratio_.sum():.1%})")
 
-    adata.obsm["X_pca"] = pca.transform(X_all).astype(np.float32)
+    X_pca = pca.transform(X_all).astype(np.float32)
+    bad_in_pca = (~np.isfinite(X_pca)).sum()
+    if bad_in_pca > 0:
+        print(f"  WARNING: {bad_in_pca} NaN/Inf values in X_pca after PCA — replacing with 0.")
+    X_pca = np.nan_to_num(X_pca, nan=0.0, posinf=0.0, neginf=0.0)
+    adata.obsm["X_pca"] = X_pca
 
     # Store PCA params for inverse-transform (used by reconstruct_from_pca)
     adata.uns["_pca_components"] = pca.components_.astype(np.float32)  # (n_pcs, n_features)
@@ -544,7 +563,43 @@ def main():
     )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
+    from cellflow.training._callbacks import BaseCallback
+
+    class NaNStopCallback(BaseCallback):
+        """Stops training when loss becomes NaN or Inf.
+
+        Checked every valid_freq iterations (on_log_iteration).
+        Raises RuntimeError so the job fails fast with a clear message.
+        """
+
+        def on_train_begin(self):
+            pass
+
+        def on_log_iteration(self, valid_source_data, valid_true_data, valid_pred_data, solver):
+            # training_logs lives on cf.trainer, not the solver
+            trainer = getattr(cf, "trainer", None)
+            if trainer is None:
+                return {}
+            loss_history = trainer.training_logs.get("loss", [])
+            if not loss_history:
+                return {}
+            recent = loss_history[-args.valid_freq:]
+            nan_count = sum(1 for v in recent if v != v or abs(v) == float("inf"))
+            if nan_count > 0:
+                msg = (
+                    f"[NaNStopCallback] {nan_count}/{len(recent)} loss values are NaN/Inf "
+                    f"in the last {args.valid_freq} iterations. "
+                    f"Last 5 losses: {recent[-5:]}. Stopping training."
+                )
+                print(f"\n[FATAL] {msg}")
+                raise RuntimeError(msg)
+            return {}
+
+        def on_train_end(self, *args, **kwargs):
+            return {}
+
     callbacks = []
+    callbacks.append(NaNStopCallback())
 
     # Metrics computed in PCA space (fast, used for monitoring)
     callbacks.append(Metrics(metrics=["r_squared", "e_distance", "mmd"]))
@@ -569,13 +624,19 @@ def main():
         cf = CellFlow.load(save_path)
     else:
         print(f"\nTraining for {args.num_iterations} iterations (valid_freq={args.valid_freq}) …")
-        cf.train(
-            num_iterations=args.num_iterations,
-            batch_size=args.batch_size,
-            valid_freq=args.valid_freq,
-            callbacks=callbacks,
-            monitor_metrics=["val_r_squared_mean"] if val_conditions else [],
-        )
+        try:
+            cf.train(
+                num_iterations=args.num_iterations,
+                batch_size=args.batch_size,
+                valid_freq=args.valid_freq,
+                callbacks=callbacks,
+                monitor_metrics=["val_r_squared_mean"] if val_conditions else [],
+            )
+        except RuntimeError as e:
+            if "NaNStopCallback" in str(e):
+                print(f"\n[FATAL] Training stopped due to NaN loss: {e}")
+                sys.exit(1)
+            raise
         cf.save(save_path, overwrite=True)
         print(f"Model saved to {save_path}/CellFlow.pkl")
 
