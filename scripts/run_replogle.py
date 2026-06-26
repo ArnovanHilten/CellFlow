@@ -516,7 +516,10 @@ def main():
     # but their embeddings are derived from held-out cells' PCA projections —
     # this is acceptable because PCA was fit on training cells, so the
     # val/test PCA values are out-of-sample projections, not training signals.
-    all_perturb_genes = list(set(train_conditions) | set(val_conditions) | set(test_conditions))
+    # Build gene_emb from ALL non-control conditions in adata, not from the split
+    # lists. This is robust to stale split caches (which may predate multi-cell-line
+    # support and lack conditions from non-target cell lines like HEPG2/RPE1/JURKAT).
+    all_perturb_genes = list(set(adata.obs["condition"].unique()) - {args.control_value})
     X_pca_all = adata.obsm["X_pca"]
     cond_vals  = adata.obs["condition"].values
     gene_emb   = {}
@@ -529,6 +532,19 @@ def main():
     # Store in adata.uns before slicing so all subsets inherit it
     adata.uns["gene_emb"] = gene_emb
     print(f"  Gene embeddings: {len(gene_emb)} genes × {args.n_pca_components} dims")
+
+    # ── 7b. Cell-line one-hot embeddings ──────────────────────────────────────
+    # Stored in adata.uns so that CellFlow can condition on cell line.
+    # One-hot encoding: each cell line gets a unit vector; order is alphabetical.
+    use_cell_line_cov = "cell_line" in adata.obs.columns
+    if use_cell_line_cov:
+        cell_lines = sorted(adata.obs["cell_line"].unique())
+        cell_line_emb = {
+            cl: np.eye(len(cell_lines), dtype=np.float32)[i]
+            for i, cl in enumerate(cell_lines)
+        }
+        adata.uns["cell_line_emb"] = cell_line_emb
+        print(f"  Cell-line embeddings: {cell_lines} (one-hot dim={len(cell_lines)})")
 
     # ── 8. Slice adatas ───────────────────────────────────────────────────────
     # train: everything except target-cell-line val/test perturbed cells
@@ -547,8 +563,31 @@ def main():
         adata_train = adata[ctrl_mask | adata.obs["condition"].isin(train_conditions).values].copy()
         adata_val   = adata[ctrl_mask | adata.obs["condition"].isin(val_conditions).values].copy()
         adata_test  = adata[ctrl_mask | adata.obs["condition"].isin(test_conditions).values].copy()
-    print(f"  adata_train: {adata_train.shape[0]} cells  "
-          f"adata_val: {adata_val.shape[0]} cells  adata_test: {adata_test.shape[0]} cells")
+    def _log_split(name: str, ad_: "ad.AnnData") -> None:
+        ctrl_col = ad_.obs["is_control"]
+        cond_col = ad_.obs["condition"]
+        has_cl = "cell_line" in ad_.obs.columns
+        total_cells = ad_.shape[0]
+        total_perts = int((~ctrl_col).sum())
+        total_conds = int(cond_col[~ctrl_col].nunique()) if total_perts else 0
+        print(f"\n  [{name}]  {total_cells} cells total"
+              f"  |  {total_perts} perturbed cells  |  {total_conds} unique perturbations")
+        if has_cl:
+            for cl in sorted(ad_.obs["cell_line"].unique()):
+                cl_mask = ad_.obs["cell_line"] == cl
+                n_cells = int(cl_mask.sum())
+                n_ctrl  = int((cl_mask & ctrl_col).sum())
+                n_pert  = int((cl_mask & ~ctrl_col).sum())
+                n_conds = int(cond_col[cl_mask & ~ctrl_col].nunique()) if n_pert else 0
+                print(f"    {cl:20s}  {n_cells:6d} cells"
+                      f"  ({n_ctrl} ctrl + {n_pert} perturbed)"
+                      f"  |  {n_conds} perturbations")
+
+    print("\n── Split summary ────────────────────────────────────────────────────────")
+    _log_split("train", adata_train)
+    _log_split("val",   adata_val)
+    _log_split("test",  adata_test)
+    print("─────────────────────────────────────────────────────────────────────────")
 
     # ── 9. CellFlow training ──────────────────────────────────────────────────
     import optax
@@ -562,7 +601,10 @@ def main():
         sample_rep="X_pca",
         control_key="is_control",
         perturbation_covariates={"gene": ["condition"]},
-        perturbation_covariate_reps={"gene": "gene_emb"},  # dict lookup → works for val/test genes
+        perturbation_covariate_reps={"gene": "gene_emb"},
+        sample_covariates=["cell_line"] if use_cell_line_cov else None,
+        sample_covariate_reps={"cell_line": "cell_line_emb"} if use_cell_line_cov else None,
+        split_covariates=["cell_line"] if use_cell_line_cov else None,
         max_combination_length=1,
     )
 
