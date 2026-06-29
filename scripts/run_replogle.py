@@ -720,6 +720,10 @@ def main():
         # With condition_id_key="condition_name", predictions is keyed by the gene
         # name strings (e.g. "BRCA1") rather than by tuples (e.g. ("BRCA1",)).
         "condition_name": test_conditions,
+        # split_covariates=["cell_line"] requires this column to be present so
+        # CellFlow can route each prediction through the correct source distribution.
+        # All test perturbations come from the competition cell line.
+        **({"cell_line": target_cell_line} if use_cell_line_cov else {}),
     })
 
     predictions = cf.predict(
