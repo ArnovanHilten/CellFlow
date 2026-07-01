@@ -71,6 +71,8 @@ def parse_args():
     # Resume / eval-only
     p.add_argument("--eval_only", action="store_true",
                    help="Skip training; load saved CellFlow.pkl from result_path and run test eval only")
+    p.add_argument("--eval_num_threads", type=int, default=32,
+                   help="Number of threads for pdex DE testing in cell-eval (default: 32)")
 
     # Decoder (embedding modes only)
     p.add_argument("--state_checkpoint", default="",
@@ -806,7 +808,7 @@ pred = ad.read_h5ad({_json.dumps(pred_path)})
 real = ad.read_h5ad({_json.dumps(real_path)})
 evaluator = MetricsEvaluator(
     adata_pred=pred, adata_real=real,
-    control_pert="control", pert_col="perturbation", num_threads=8,
+    control_pert="control", pert_col="perturbation", num_threads={args.eval_num_threads},
 )
 results, agg = evaluator.compute()
 results.write_csv({_json.dumps(results_csv)})
