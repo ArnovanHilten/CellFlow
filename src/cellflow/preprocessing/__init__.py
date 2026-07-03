@@ -1,3 +1,8 @@
+from cellflow.preprocessing._functional_emb import (
+    FUNCTIONAL_EMBEDDING_SOURCES,
+    FunctionalEmbeddingConfig,
+    load_functional_gene_embeddings,
+)
 from cellflow.preprocessing._gene_emb import (
     GeneInfo,
     get_esm_embedding,

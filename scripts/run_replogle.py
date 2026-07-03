@@ -63,6 +63,26 @@ def parse_args():
     p.add_argument("--hidden_dim",              type=int, default=512, help="Hidden layer width (same for all layers)")
     p.add_argument("--n_hidden_layers",         type=int, default=3)
 
+    # Functional gene embeddings (QuantumCell) — optional; replace the default
+    # mean-PCA-profile gene representation with pre-trained functional embeddings.
+    p.add_argument("--embeddings_dir", default="",
+                   help="Directory with QuantumCell *.npz embedding files. If set, the gene "
+                        "perturbation is represented by these functional embeddings instead of "
+                        "the mean-PCA-profile 'gene_emb'.")
+    p.add_argument("--embedding_sources", default="all",
+                   help="Comma-separated source names (e.g. 'consensus,Reactome,DepMap') or 'all' "
+                        "for the curated set (consensus/STRING/Reactome/GeneOntology/MSigDB/"
+                        "WikiPathways/DepMap/GTEx/GWASAtlas/CellPainting/ESM-2).")
+    p.add_argument("--embedding_fusion", default="concat", choices=["concat", "multi_stream"],
+                   help="'concat' fuses sources into one vector; 'multi_stream' gives each source "
+                        "its own covariate group + projection sub-network.")
+    p.add_argument("--embedding_anchor", default="ESM-2",
+                   help="Always-on anchor source guaranteeing near-universal coverage (no gene "
+                        "ever null). Empty string disables the anchor.")
+    p.add_argument("--embedding_gene_id_map", default="",
+                   help="Optional CSV/parquet mapping gene symbol -> Ensembl gene ID (first two "
+                        "columns). Needed if the condition column holds symbols rather than ENSG.")
+
     # W&B
     p.add_argument("--wandb_project", default="", help="W&B project name; leave empty to disable W&B")
     p.add_argument("--wandb_entity",  default="", help="W&B entity (team or username)")
@@ -548,6 +568,47 @@ def main():
         adata.uns["cell_line_emb"] = cell_line_emb
         print(f"  Cell-line embeddings: {cell_lines} (one-hot dim={len(cell_lines)})")
 
+    # ── 7c. Functional gene embeddings (QuantumCell) — optional ───────────────
+    # Must run BEFORE slicing so all train/val/test subsets inherit the uns dicts
+    # and (multi_stream) the per-source obs columns.
+    func_cfg = None
+    if args.embeddings_dir:
+        from cellflow.preprocessing import (
+            FUNCTIONAL_EMBEDDING_SOURCES,
+            load_functional_gene_embeddings,
+        )
+
+        if args.embedding_sources.strip().lower() == "all":
+            sources = list(FUNCTIONAL_EMBEDDING_SOURCES)
+        else:
+            sources = [s.strip() for s in args.embedding_sources.split(",") if s.strip()]
+
+        gene_id_map = None
+        if args.embedding_gene_id_map:
+            _m = (
+                pd.read_parquet(args.embedding_gene_id_map)
+                if args.embedding_gene_id_map.endswith(".parquet")
+                else pd.read_csv(args.embedding_gene_id_map)
+            )
+            gene_id_map = dict(zip(_m.iloc[:, 0].astype(str), _m.iloc[:, 1].astype(str)))
+            print(f"  Gene-ID map: {len(gene_id_map)} symbol→ENSG entries from {args.embedding_gene_id_map}")
+
+        func_cfg = load_functional_gene_embeddings(
+            adata,
+            args.embeddings_dir,
+            sources=sources,
+            gene_cols=["condition"],
+            base_group="gene",
+            fusion=args.embedding_fusion,
+            anchor=(args.embedding_anchor or None),
+            gene_id_map=gene_id_map,
+            on_missing="mean",
+            ignore_values=[args.control_value],
+        )
+        print(f"  Functional embeddings: sources={func_cfg.sources} fusion={func_cfg.fusion}")
+        print(f"    per-source coverage: {func_cfg.per_source_coverage}")
+        print(f"    genes with NO signal in any source: {func_cfg.n_fully_unmapped}")
+
     # ── 8. Slice adatas ───────────────────────────────────────────────────────
     # train: everything except target-cell-line val/test perturbed cells
     #        → all non-target cell lines + target-line training cells + all ctrl
@@ -599,11 +660,20 @@ def main():
 
     cf = CellFlow(adata_train, solver="otfm")
 
+    # Perturbation representation: functional embeddings if provided, else the
+    # default mean-PCA-profile 'gene_emb'.
+    if func_cfg is not None:
+        pert_kwargs = func_cfg.prepare_data_kwargs()
+    else:
+        pert_kwargs = {
+            "perturbation_covariates": {"gene": ["condition"]},
+            "perturbation_covariate_reps": {"gene": "gene_emb"},
+        }
+
     cf.prepare_data(
         sample_rep="X_pca",
         control_key="is_control",
-        perturbation_covariates={"gene": ["condition"]},
-        perturbation_covariate_reps={"gene": "gene_emb"},
+        **pert_kwargs,
         sample_covariates=["cell_line"] if use_cell_line_cov else None,
         sample_covariate_reps={"cell_line": "cell_line_emb"} if use_cell_line_cov else None,
         split_covariates=["cell_line"] if use_cell_line_cov else None,
@@ -619,6 +689,10 @@ def main():
         )
 
     dims = tuple([args.hidden_dim] * args.n_hidden_layers)
+    model_kwargs = {}
+    # multi_stream: give each source its own projection sub-network before pooling.
+    if func_cfg is not None and func_cfg.fusion == "multi_stream":
+        model_kwargs["layers_before_pool"] = func_cfg.layers_before_pool()
     cf.prepare_model(
         condition_embedding_dim=args.condition_embedding_dim,
         hidden_dims=dims,
@@ -626,6 +700,7 @@ def main():
         time_encoder_dims=dims,
         pooling="attention_token",
         optimizer=optax.adam(args.lr),
+        **model_kwargs,
     )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
