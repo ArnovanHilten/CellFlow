@@ -585,13 +585,28 @@ def main():
 
         gene_id_map = None
         if args.embedding_gene_id_map:
-            _m = (
-                pd.read_parquet(args.embedding_gene_id_map)
-                if args.embedding_gene_id_map.endswith(".parquet")
-                else pd.read_csv(args.embedding_gene_id_map)
-            )
-            gene_id_map = dict(zip(_m.iloc[:, 0].astype(str), _m.iloc[:, 1].astype(str)))
-            print(f"  Gene-ID map: {len(gene_id_map)} symbol→ENSG entries from {args.embedding_gene_id_map}")
+            if args.embedding_gene_id_map.endswith(".parquet"):
+                _m = pd.read_parquet(args.embedding_gene_id_map)
+            else:
+                # sniff delimiter so TSV (e.g. gencode.*.gene_map.tsv) and CSV both work
+                _m = pd.read_csv(args.embedding_gene_id_map, sep=None, engine="python")
+            _m.columns = [str(c) for c in _m.columns]
+            cols = list(_m.columns)
+            # symbol column -> UNVERSIONED Ensembl gene id (embeddings use ENSG w/o version).
+            if "gene_name" in cols and "gene_id_base" in cols:
+                key_col, val_col = "gene_name", "gene_id_base"
+            elif "gene_name" in cols and "gene_id" in cols:
+                key_col, val_col = "gene_name", "gene_id"
+            else:
+                key_col, val_col = cols[0], cols[1]
+            # On duplicate symbols, let protein-coding rows win (dict(zip) keeps the
+            # last, so sort protein-coding rows to the end).
+            if "gene_type" in cols:
+                _m = _m.sort_values("gene_type", key=lambda s: s.eq("protein_coding"))
+            vals = _m[val_col].astype(str).str.split(".").str[0]  # strip version if any
+            gene_id_map = dict(zip(_m[key_col].astype(str), vals))
+            print(f"  Gene-ID map: {len(gene_id_map)} '{key_col}'→'{val_col}' entries "
+                  f"from {args.embedding_gene_id_map}")
 
         func_cfg = load_functional_gene_embeddings(
             adata,
