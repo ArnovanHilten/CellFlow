@@ -235,6 +235,29 @@ class TestAnchor:
                 adata, emb_dir, sources=["NoSuchSource"], fusion="concat", anchor=None
             )
 
+    def test_combined_shortcut(self, emb_dir):
+        # 'combined' resolves to gene_embeddings_combined.npz and is NOT in the
+        # curated 'all' set.
+        _write_npz(emb_dir / "gene_embeddings_combined.npz", GENES, 12)
+        adata = _make_genetic_adata(GENES[:6])
+        cfg = load_functional_gene_embeddings(
+            adata, emb_dir, sources=["combined"], fusion="concat", anchor=None,
+            ignore_values=["control"],
+        )
+        assert cfg.sources == ["combined"]
+        assert cfg.embedding_dims["gene"] == 12
+
+    def test_bad_schema_raises_clearly(self, emb_dir):
+        import numpy as _np
+
+        # a file without the required 'gene_ids' key
+        _np.savez(emb_dir / "Broken.npz", embedding=_np.zeros((8, 4), dtype=_np.float32))
+        adata = _make_genetic_adata(GENES[:6])
+        with pytest.raises(KeyError, match="missing required key"):
+            load_functional_gene_embeddings(
+                adata, emb_dir, sources=["Broken"], fusion="concat", anchor=None
+            )
+
     def test_anchor_none(self, emb_dir):
         adata = _make_genetic_adata(GENES[:6])
         cfg = load_functional_gene_embeddings(

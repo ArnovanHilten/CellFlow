@@ -41,8 +41,12 @@ FUNCTIONAL_EMBEDDING_SOURCES: dict[str, str] = {
 
 # Some sources ship under different filenames across environments (e.g. the signed
 # vs unsigned GWAS Atlas build). Resolution tries these candidate stems in order.
+# ``combined`` is the pre-fused "everything" vector (state_integration/combine.py);
+# it is intentionally NOT in FUNCTIONAL_EMBEDDING_SOURCES so the curated "all" set
+# excludes it — request it explicitly (typically with anchor=None).
 _SOURCE_FILE_ALIASES: dict[str, list[str]] = {
     "GWASAtlas": ["GWASAtlas", "GWASAtlas_signed"],
+    "combined": ["gene_embeddings_combined"],
 }
 
 
@@ -175,8 +179,20 @@ def _load_source_npz(
     genes missing from this source.
     """
     data = np.load(path, allow_pickle=True)
+    for key in ("embedding", "gene_ids"):
+        if key not in data.files:
+            raise KeyError(
+                f"Embedding file {path} is missing required key '{key}'. "
+                f"Found keys: {list(data.files)}. Expected the standardised "
+                f"'embedding'/'gene_ids'/'mask' schema."
+            )
     emb = np.asarray(data["embedding"], dtype=np.float32)
     gene_ids = np.asarray(data["gene_ids"]).astype(str)
+    if emb.ndim != 2 or emb.shape[0] != len(gene_ids):
+        raise ValueError(
+            f"Embedding file {path}: 'embedding' shape {emb.shape} is incompatible with "
+            f"{len(gene_ids)} gene_ids (expected (n_genes, dim))."
+        )
     # ``mask`` True == gene absent / zero-imputed in the source.
     present = ~np.asarray(data["mask"], dtype=bool) if "mask" in data.files else np.ones(len(gene_ids), dtype=bool)
     if l2_normalize:
