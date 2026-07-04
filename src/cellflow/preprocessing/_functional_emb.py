@@ -39,6 +39,12 @@ FUNCTIONAL_EMBEDDING_SOURCES: dict[str, str] = {
     "ESM-2": "ESM-2",
 }
 
+# Some sources ship under different filenames across environments (e.g. the signed
+# vs unsigned GWAS Atlas build). Resolution tries these candidate stems in order.
+_SOURCE_FILE_ALIASES: dict[str, list[str]] = {
+    "GWASAtlas": ["GWASAtlas", "GWASAtlas_signed"],
+}
+
 
 @dataclass
 class FunctionalEmbeddingConfig:
@@ -136,9 +142,29 @@ def _l2_normalize(mat: np.ndarray) -> np.ndarray:
     return mat / norms
 
 
+def _resolve_source_file(embeddings_dir: PathLike, source: str) -> str:
+    """Find the .npz file for a source, trying known filename aliases."""
+    stem = FUNCTIONAL_EMBEDDING_SOURCES.get(source, source)
+    candidates = _SOURCE_FILE_ALIASES.get(source, [stem])
+    if stem not in candidates:
+        candidates = [stem, *candidates]
+    for cand in candidates:
+        path = os.path.join(str(embeddings_dir), f"{cand}.npz")
+        if os.path.exists(path):
+            return path
+    available = (
+        sorted(f[:-4] for f in os.listdir(embeddings_dir) if f.endswith(".npz"))
+        if os.path.isdir(embeddings_dir)
+        else []
+    )
+    raise FileNotFoundError(
+        f"No embedding file for source '{source}' in {embeddings_dir} "
+        f"(tried {[f'{c}.npz' for c in candidates]}). Available: {available}"
+    )
+
+
 def _load_source_npz(
-    embeddings_dir: PathLike,
-    file_stem: str,
+    path: str,
     l2_normalize: bool,
 ) -> tuple[dict[str, np.ndarray], int, np.ndarray]:
     """Load one QuantumCell ``.npz`` into ``{ENSG: vector}``, its dim, and its mean.
@@ -148,9 +174,6 @@ def _load_source_npz(
     returned mean is over the *present* rows and is used as the nonzero fill for
     genes missing from this source.
     """
-    path = os.path.join(str(embeddings_dir), f"{file_stem}.npz")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Embedding file not found: {path}")
     data = np.load(path, allow_pickle=True)
     emb = np.asarray(data["embedding"], dtype=np.float32)
     gene_ids = np.asarray(data["gene_ids"]).astype(str)
@@ -317,8 +340,8 @@ def load_functional_gene_embeddings(
     per_source_dims: dict[str, int] = {}
     per_source_mean: dict[str, np.ndarray] = {}
     for source in sources:
-        file_stem = FUNCTIONAL_EMBEDDING_SOURCES.get(source, source)
-        mapping, dim, mean_vec = _load_source_npz(embeddings_dir, file_stem, l2_normalize)
+        path = _resolve_source_file(embeddings_dir, source)
+        mapping, dim, mean_vec = _load_source_npz(path, l2_normalize)
         per_source_maps[source] = mapping
         per_source_dims[source] = dim
         per_source_mean[source] = mean_vec

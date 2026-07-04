@@ -216,6 +216,25 @@ class TestAnchor:
         )
         assert cfg.sources.count("ESM-2") == 1
 
+    def test_gwas_signed_alias(self, emb_dir):
+        # On some environments GWAS ships as GWASAtlas_signed.npz; "GWASAtlas" must
+        # still resolve to it.
+        _write_npz(emb_dir / "GWASAtlas_signed.npz", GENES, 7)
+        adata = _make_genetic_adata(GENES[:6])
+        cfg = load_functional_gene_embeddings(
+            adata, emb_dir, sources=["GWASAtlas"], fusion="multi_stream", anchor=None,
+            ignore_values=["control"],
+        )
+        assert cfg.embedding_dims["gene_GWASAtlas"] == 7
+        assert all(v.shape == (7,) for v in adata.uns["func_emb_GWASAtlas"].values())
+
+    def test_missing_source_lists_available(self, emb_dir):
+        adata = _make_genetic_adata(GENES[:6])
+        with pytest.raises(FileNotFoundError, match="Available:"):
+            load_functional_gene_embeddings(
+                adata, emb_dir, sources=["NoSuchSource"], fusion="concat", anchor=None
+            )
+
     def test_anchor_none(self, emb_dir):
         adata = _make_genetic_adata(GENES[:6])
         cfg = load_functional_gene_embeddings(
