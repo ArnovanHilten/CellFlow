@@ -285,12 +285,28 @@ def main():
     print(f"Loading {h5ad_path} …")
     adata = sc.read_h5ad(h5ad_path)
 
-    # ── 2. Normalise if needed (counts mode only) ─────────────────────────────
+    # ── 2. Filter to target cell line only (k562_only mode) ──────────────────
+    if "cell_line" in adata.obs.columns and args.split_toml:
+        with open(args.split_toml, "rb") as _f:
+            _fewshot_keys = list(tomllib.load(_f).get("fewshot", {}).keys())
+        _lines_in_toml = {k.split(".")[-1] for k in _fewshot_keys}
+        _matched = _lines_in_toml & set(adata.obs["cell_line"].unique())
+        if _matched:
+            target_cell_line = sorted(_matched)[0]
+            adata = adata[adata.obs["cell_line"] == target_cell_line].copy()
+            print(f"  Filtered to cell line '{target_cell_line}': {adata.shape}")
+        else:
+            target_cell_line = None
+            print(f"  Warning: toml cell lines {_lines_in_toml} not found — using all cells")
+    else:
+        target_cell_line = None
+
+    # ── 3. Normalise if needed (counts mode only) ─────────────────────────────
     if args.input_rep == "counts" and not args.preprocessed:
         sc.pp.normalize_total(adata)
         sc.pp.log1p(adata)
 
-    # ── 3. Add metadata columns ───────────────────────────────────────────────
+    # ── 4. Add metadata columns ───────────────────────────────────────────────
     adata.obs["condition"]  = adata.obs[args.condition_col].astype(str)
     adata.obs["is_control"] = (adata.obs["condition"] == args.control_value)
 
@@ -306,30 +322,11 @@ def main():
         adata = adata[:, adata.var["highly_variable"]].copy()
         print(f"  HVG matrix: {adata.shape}")
 
-    # ── 5. Parse toml split (BEFORE PCA — determines training cells) ──────────
-    # Design: the toml fewshot key encodes which cell line is the "competition"
-    # cell line (e.g. "replogle.k562" → k562).  Only that cell line's
-    # perturbations are held out for val/test.  All other cell lines
-    # (jurkat, rpe1, hepg2, …) contribute ALL their cells to training,
-    # even if they share a perturbation gene that is in the val/test list.
+    # ── 5. Parse toml split ────────────────────────────────────────────────────
     toml_stem   = Path(args.split_toml).stem if args.split_toml else "random"
-    split_cache = os.path.join(args.data_path, args.data_name, f"split_results_cellflow_{toml_stem}.pkl")
+    cl_suffix   = f"_{target_cell_line}" if target_cell_line else "_all"
+    split_cache = os.path.join(args.data_path, args.data_name, f"split_results_cellflow_{toml_stem}{cl_suffix}.pkl")
     os.makedirs(os.path.dirname(split_cache), exist_ok=True)
-
-    # Infer the target (competition) cell line from the toml fewshot key.
-    target_cell_line = None
-    if args.split_toml and "cell_line" in adata.obs.columns:
-        with open(args.split_toml, "rb") as _f:
-            _fewshot_keys = list(tomllib.load(_f).get("fewshot", {}).keys())
-        _lines_in_toml = {k.split(".")[-1] for k in _fewshot_keys}
-        _matched = _lines_in_toml & set(adata.obs["cell_line"].unique())
-        if _matched:
-            target_cell_line = sorted(_matched)[0]
-            print(f"  Competition cell line: '{target_cell_line}' "
-                  f"(other cell lines are all-train)")
-        else:
-            print(f"  Warning: toml cell lines {_lines_in_toml} not found in "
-                  f"adata.obs['cell_line']; applying split to all cells")
 
     if args.split_toml and os.path.exists(split_cache):
         with open(split_cache, "rb") as f:
@@ -337,31 +334,17 @@ def main():
         val_conditions   = sr["val"]
         test_conditions  = sr["test"]
         train_conditions = sr["train"]
-        target_cell_line = sr.get("target_cell_line", target_cell_line)
     elif args.split_toml:
         val_genes, test_genes = parse_toml_split(args.split_toml)
-
-        # Derive held-out conditions from the TARGET cell line only
-        if target_cell_line and "cell_line" in adata.obs.columns:
-            tcl_mask = adata.obs["cell_line"] == target_cell_line
-            source_conds = set(adata.obs.loc[tcl_mask, "condition"].unique()) - {args.control_value}
-        else:
-            source_conds = set(adata.obs["condition"].unique()) - {args.control_value}
-
-        test_set       = {c for c in source_conds if c in test_genes}
-        val_set        = {c for c in source_conds if c in val_genes} - test_set
+        all_conds = set(adata.obs["condition"].unique()) - {args.control_value}
+        test_set  = {c for c in all_conds if c in test_genes}
+        val_set   = {c for c in all_conds if c in val_genes} - test_set
         val_conditions  = sorted(val_set)
         test_conditions = sorted(test_set)
-
-        # train_conditions = all gene names NOT in val/test (used for gene_emb + split cache)
-        all_conds        = set(adata.obs["condition"].unique()) - {args.control_value}
         train_conditions = sorted(all_conds - val_set - test_set)
-
-        print(f"STATE toml split ({target_cell_line or 'all cells'}): "
-              f"{len(train_conditions)} train / "
+        print(f"STATE toml split: {len(train_conditions)} train / "
               f"{len(val_conditions)} val / {len(test_conditions)} test perturbations")
-        sr = {"train": train_conditions, "val": val_conditions,
-              "test": test_conditions, "target_cell_line": target_cell_line}
+        sr = {"train": train_conditions, "val": val_conditions, "test": test_conditions}
         with open(split_cache, "wb") as f:
             pickle.dump(sr, f)
     else:
@@ -376,20 +359,12 @@ def main():
         print(f"Random split: {len(train_conditions)} train / {len(test_conditions)} test")
 
     # ── 6. PCA fitted on TRAINING CELLS ONLY ─────────────────────────────────
-    # Training cells: all cells except the target-cell-line val/test perturbed cells.
-    # Non-target cell lines (jurkat, rpe1, hepg2) are always included in PCA fitting.
     from sklearn.decomposition import PCA as SklearnPCA
 
-    val_test_set = set(val_conditions) | set(test_conditions)
-    if target_cell_line and "cell_line" in adata.obs.columns:
-        tcl_mask = (adata.obs["cell_line"] == target_cell_line).values
-        held_out_mask = tcl_mask & adata.obs["condition"].isin(val_test_set).values
-        train_cell_mask = ~held_out_mask
-    else:
-        train_cell_mask = (
-            adata.obs["is_control"] |
-            adata.obs["condition"].isin(train_conditions)
-        ).values
+    val_test_set    = set(val_conditions) | set(test_conditions)
+    train_cell_mask = (
+        adata.obs["is_control"] | adata.obs["condition"].isin(train_conditions)
+    ).values
 
     if args.input_rep == "counts":
         X_all = adata.X
@@ -535,36 +510,11 @@ def main():
     adata.uns["gene_emb"] = gene_emb
     print(f"  Gene embeddings: {len(gene_emb)} genes × {args.n_pca_components} dims")
 
-    # ── 7b. Cell-line one-hot embeddings ──────────────────────────────────────
-    # Stored in adata.uns so that CellFlow can condition on cell line.
-    # One-hot encoding: each cell line gets a unit vector; order is alphabetical.
-    use_cell_line_cov = "cell_line" in adata.obs.columns
-    if use_cell_line_cov:
-        cell_lines = sorted(adata.obs["cell_line"].unique())
-        cell_line_emb = {
-            cl: np.eye(len(cell_lines), dtype=np.float32)[i]
-            for i, cl in enumerate(cell_lines)
-        }
-        adata.uns["cell_line_emb"] = cell_line_emb
-        print(f"  Cell-line embeddings: {cell_lines} (one-hot dim={len(cell_lines)})")
-
     # ── 8. Slice adatas ───────────────────────────────────────────────────────
-    # train: everything except target-cell-line val/test perturbed cells
-    #        → all non-target cell lines + target-line training cells + all ctrl
-    # val:   target-cell-line control cells + target-cell-line val perturbed cells
-    # test:  target-cell-line control cells + target-cell-line test perturbed cells
-    ctrl_mask = adata.obs["is_control"].values
-    if target_cell_line and "cell_line" in adata.obs.columns:
-        tcl_mask      = (adata.obs["cell_line"] == target_cell_line).values
-        k562_val_mask  = tcl_mask & adata.obs["condition"].isin(val_conditions).values
-        k562_test_mask = tcl_mask & adata.obs["condition"].isin(test_conditions).values
-        adata_train = adata[~k562_val_mask & ~k562_test_mask].copy()
-        adata_val   = adata[(ctrl_mask & tcl_mask) | k562_val_mask].copy()
-        adata_test  = adata[(ctrl_mask & tcl_mask) | k562_test_mask].copy()
-    else:
-        adata_train = adata[ctrl_mask | adata.obs["condition"].isin(train_conditions).values].copy()
-        adata_val   = adata[ctrl_mask | adata.obs["condition"].isin(val_conditions).values].copy()
-        adata_test  = adata[ctrl_mask | adata.obs["condition"].isin(test_conditions).values].copy()
+    ctrl_mask   = adata.obs["is_control"].values
+    adata_train = adata[ctrl_mask | adata.obs["condition"].isin(train_conditions).values].copy()
+    adata_val   = adata[ctrl_mask | adata.obs["condition"].isin(val_conditions).values].copy()
+    adata_test  = adata[ctrl_mask | adata.obs["condition"].isin(test_conditions).values].copy()
     def _log_split(name: str, ad_: "ad.AnnData") -> None:
         ctrl_col = ad_.obs["is_control"]
         cond_col = ad_.obs["condition"]
@@ -604,9 +554,6 @@ def main():
         control_key="is_control",
         perturbation_covariates={"gene": ["condition"]},
         perturbation_covariate_reps={"gene": "gene_emb"},
-        sample_covariates=["cell_line"] if use_cell_line_cov else None,
-        sample_covariate_reps={"cell_line": "cell_line_emb"} if use_cell_line_cov else None,
-        split_covariates=["cell_line"] if use_cell_line_cov else None,
         max_combination_length=1,
     )
 
@@ -722,10 +669,6 @@ def main():
         # With condition_id_key="condition_name", predictions is keyed by the gene
         # name strings (e.g. "BRCA1") rather than by tuples (e.g. ("BRCA1",)).
         "condition_name": test_conditions,
-        # split_covariates=["cell_line"] requires this column to be present so
-        # CellFlow can route each prediction through the correct source distribution.
-        # All test perturbations come from the competition cell line.
-        **({"cell_line": target_cell_line} if use_cell_line_cov else {}),
     })
 
     predictions = cf.predict(
