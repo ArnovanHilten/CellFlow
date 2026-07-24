@@ -817,6 +817,13 @@ def main():
         # All test perturbations come from the competition cell line.
         **({"cell_line": target_cell_line} if use_cell_line_cov else {}),
     })
+    # multi_stream fusion duplicates the gene column per source (condition__<src>);
+    # the prediction covariate_df must carry those columns too (same gene value).
+    if func_cfg is not None:
+        for cols in func_cfg.perturbation_covariates.values():
+            for col in cols:
+                if col not in covariate_df.columns:
+                    covariate_df[col] = covariate_df["condition"].values
 
     predictions = cf.predict(
         adata=control_cells,
