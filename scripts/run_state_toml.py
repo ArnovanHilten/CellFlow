@@ -28,8 +28,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # reuse run_replogle's gene-space decoder helpers
-from run_replogle import load_state_decoder, reconstruct_from_pca  # noqa: E402
-from state_toml_loader import load_state_toml_adatas  # noqa: E402
+from run_replogle import load_state_decoder, reconstruct_from_pca
+from state_toml_loader import load_state_toml_adatas
 
 
 def make_save_path(args):
@@ -47,11 +47,15 @@ def make_save_path(args):
         "fusion": args.embedding_fusion,
     }
     h = hashlib.md5(json.dumps(key, sort_keys=True).encode()).hexdigest()[:8]
-    name = f"{args.run_id}_{args.data_name}" if args.run_id else f"{args.data_name}_{h}"
+    # run_id is used verbatim as the folder name (it already encodes the config);
+    # only fall back to data_name + hash when no run_id is given. Avoids the previous
+    # double "<run_id>_<data_name>" when run_id already contained data_name.
+    name = args.run_id if args.run_id else f"{args.data_name}_{h}"
     return os.path.join(args.result_path, name)
 
 
 def parse_args():
+    """Parse command-line arguments."""
     p = argparse.ArgumentParser(description="Train CellFlow on a STATE-style TOML with functional embeddings")
 
     # Data / split
@@ -129,6 +133,7 @@ def _load_gene_id_map(path):
 
 
 def main():
+    """Load the STATE-TOML split, train CellFlow with functional embeddings, and evaluate."""
     args = parse_args()
     save_path = make_save_path(args)
     os.makedirs(save_path, exist_ok=True)
@@ -171,7 +176,20 @@ def main():
     state_decoder = state_decoder_gene_idx = None
     if is_embedding_mode:
         if args.state_checkpoint:
-            state_decoder, _ = load_state_decoder(args.state_checkpoint)
+            state_decoder, decoder_gene_names = load_state_decoder(args.state_checkpoint)
+            # Align adata.X to the decoder's fixed gene set so decoded predictions and
+            # ground-truth .X share a gene axis (mirrors run_replogle).
+            if decoder_gene_names is not None:
+                dg = set(decoder_gene_names)
+                genes = [g for g in adata_train.var_names if g in dg]
+                g2i = {g: i for i, g in enumerate(decoder_gene_names)}
+                state_decoder_gene_idx = np.array([g2i[g] for g in genes], dtype=np.int64)
+                adata_train = adata_train[:, genes].copy()
+                if adata_val is not None:
+                    adata_val = adata_val[:, genes].copy()
+                if adata_test is not None:
+                    adata_test = adata_test[:, genes].copy()
+                print(f"  STATE decoder: evaluating on {len(genes)} overlapping genes")
         else:
             from sklearn.linear_model import Ridge
 
@@ -199,20 +217,27 @@ def main():
         gene_id_map = _load_gene_id_map(args.embedding_gene_id_map)
         # Apply to every split so uns reps + (multi_stream) obs columns exist for
         # prepare_data / prepare_validation_data / predict.
-        for a in (adata_train, adata_val, adata_test):
+        func_cfg = None
+        for split_name, a in (("train", adata_train), ("val", adata_val), ("test", adata_test)):
             if a is None:
                 continue
-            func_cfg = load_functional_gene_embeddings(
+            cfg = load_functional_gene_embeddings(
                 a, args.embeddings_dir, sources=sources, gene_cols=["condition"],
                 base_group="gene", fusion=args.embedding_fusion,
                 anchor=(args.embedding_anchor or None), gene_id_map=gene_id_map,
                 on_missing="mean", ignore_values=[args.control_pert],
             )
+            # coverage is per-split: held-out val/test genes are what drive generalization.
+            print(f"  [{split_name}] functional-emb coverage {cfg.per_source_coverage} "
+                  f"| fully-unmapped genes: {cfg.n_fully_unmapped}")
+            if split_name == "train":
+                func_cfg = cfg  # train cfg defines the covariate wiring used below
         print(f"  Functional embeddings: sources={func_cfg.sources} fusion={func_cfg.fusion}")
-        print(f"    train per-source coverage: {func_cfg.per_source_coverage}")
 
     # ── 5. CellFlow ───────────────────────────────────────────────────────────
+    import jax
     import optax
+
     from cellflow.model import CellFlow
     from cellflow.training import Metrics
 
@@ -255,6 +280,46 @@ def main():
     )
 
     callbacks = [Metrics(metrics=["r_squared", "e_distance", "mmd"])]
+
+    has_val = adata_val is not None and (~adata_val.obs["is_control"]).any()
+
+    # Best-checkpoint on the validation set: training loss → 0 while held-out R²
+    # degrades (overfitting), so we keep the inference params from the iteration
+    # with the highest val_r_squared_mean instead of the last ones. Subclasses
+    # Metrics so it computes the same value itself (order-independent) and snapshots
+    # solver.vf_state_inference.params (what predict uses) to host memory.
+    best_ckpt = None
+    if has_val:
+        class BestValCheckpoint(Metrics):
+            def __init__(self):
+                super().__init__(metrics=["r_squared"])
+                self.best = None
+                self.best_params = None
+                self.best_iter = -1
+                self._n = 0
+
+            def _maybe_update(self, vs, vt, vp, solver):
+                out = super().on_log_iteration(vs, vt, vp, solver)
+                self._n += 1
+                v = out.get("val_r_squared_mean")
+                if v is None or v != v:  # missing / NaN
+                    return
+                if self.best is None or v > self.best:
+                    self.best = float(v)
+                    self.best_iter = self._n
+                    self.best_params = jax.device_get(solver.vf_state_inference.params)
+
+            def on_log_iteration(self, vs, vt, vp, solver):
+                self._maybe_update(vs, vt, vp, solver)
+                return {}
+
+            def on_train_end(self, vs, vt, vp, solver):
+                self._maybe_update(vs, vt, vp, solver)
+                return {}
+
+        best_ckpt = BestValCheckpoint()
+        callbacks.append(best_ckpt)
+
     if args.wandb_project:
         from cellflow.training import WandbLogger
 
@@ -265,7 +330,17 @@ def main():
 
     cf.train(num_iterations=args.num_iterations, batch_size=args.batch_size,
              valid_freq=args.valid_freq, callbacks=callbacks,
-             monitor_metrics=["val_r_squared_mean"] if adata_val is not None else [])
+             monitor_metrics=["val_r_squared_mean"] if has_val else [])
+
+    # Restore the best-validation inference params (predict/eval + save use them).
+    if best_ckpt is not None and best_ckpt.best_params is not None:
+        import jax.numpy as jnp
+
+        cf.solver.vf_state_inference = cf.solver.vf_state_inference.replace(
+            params=jax.tree_util.tree_map(jnp.asarray, best_ckpt.best_params)
+        )
+        print(f"Restored best val_r_squared_mean={best_ckpt.best:.4f} "
+              f"(validation #{best_ckpt.best_iter}) for eval/save.")
     cf.save(save_path, overwrite=True)
     print(f"Model saved to {save_path}/CellFlow.pkl")
 
@@ -299,24 +374,73 @@ def main():
         return reconstruct_from_pca(X_pca, adata_test, state_decoder=state_decoder,
                                     state_decoder_gene_idx=state_decoder_gene_idx)
 
+    def _real(cells):
+        # ground truth in the SAME space _decode() outputs: obsm[embed_key] for the
+        # X_hvg (PCA-inverse) path, gene-space .X for the X_state (decoder) path.
+        if is_embedding_mode:
+            X = cells.X
+            return np.asarray(X.toarray() if hasattr(X, "toarray") else X)
+        return np.asarray(cells.obsm[args.embed_key])
+
     pred_expr, pred_names, real_expr, real_names = [], [], [], []
+    # control baseline (needed by cell-eval, which computes effects relative to control)
+    pred_expr.append(_decode(control_cells.obsm["X_pca"]))
+    pred_names += ["control"] * pred_expr[-1].shape[0]
+    real_expr.append(_real(control_cells))
+    real_names += ["control"] * real_expr[-1].shape[0]
+
+    skipped = []
     for _, row in covariate_df.iterrows():
         key = row["condition_name"]
         if key not in predictions:
+            skipped.append(key)
             continue
         pred_expr.append(_decode(predictions[key]))
         pred_names += [row["condition"]] * pred_expr[-1].shape[0]
         rc = adata_test[(adata_test.obs["condition"] == row["condition"]) &
                         (adata_test.obs[args.cell_type_key] == row[args.cell_type_key])]
-        rg = rc.X.toarray() if hasattr(rc.X, "toarray") else np.asarray(rc.X)
-        real_expr.append(rg)
-        real_names += [row["condition"]] * rg.shape[0]
+        real_expr.append(_real(rc))
+        real_names += [row["condition"]] * real_expr[-1].shape[0]
 
-    ad.AnnData(X=np.concatenate(pred_expr), obs=pd.DataFrame({"perturbation": pred_names})).write_h5ad(
-        os.path.join(final_path, "pred.h5ad"))
-    ad.AnnData(X=np.concatenate(real_expr), obs=pd.DataFrame({"perturbation": real_names})).write_h5ad(
-        os.path.join(final_path, "real.h5ad"))
-    print(f"Wrote pred/real to {final_path} — run cell-eval on these for DEG metrics.")
+    pred_path = os.path.join(final_path, "pred.h5ad")
+    real_path = os.path.join(final_path, "real.h5ad")
+    ad.AnnData(X=np.concatenate(pred_expr).astype(np.float32),
+               obs=pd.DataFrame({"perturbation": pred_names})).write_h5ad(pred_path)
+    ad.AnnData(X=np.concatenate(real_expr).astype(np.float32),
+               obs=pd.DataFrame({"perturbation": real_names})).write_h5ad(real_path)
+    if skipped:
+        print(f"  {len(skipped)} test conditions not returned by predict() were skipped.")
+    print(f"Wrote pred/real to {final_path}")
+
+    # ── 7. cell-eval metrics (subprocess: pdex forks, which deadlocks with JAX) ──
+    import json as _json
+    import subprocess
+
+    results_csv = os.path.join(final_path, "results.csv")
+    agg_csv = os.path.join(final_path, "agg_results.csv")
+    eval_script = f"""
+import anndata as ad, json
+from cell_eval import MetricsEvaluator
+pred = ad.read_h5ad({_json.dumps(pred_path)})
+real = ad.read_h5ad({_json.dumps(real_path)})
+ev = MetricsEvaluator(adata_pred=pred, adata_real=real, control_pert="control",
+                      pert_col="perturbation", num_threads={args.eval_num_threads})
+results, agg = ev.compute()
+results.write_csv({_json.dumps(results_csv)})
+agg.write_csv({_json.dumps(agg_csv)})
+"""
+    try:
+        proc = subprocess.run([sys.executable, "-c", eval_script], text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"cell-eval exited {proc.returncode}")
+        agg_df = pd.read_csv(agg_csv)
+        mean_row = agg_df[agg_df["statistic"] == "mean"].iloc[0].to_dict()
+        print("Test metrics (mean across perturbations):")
+        for k, v in mean_row.items():
+            if isinstance(v, float):
+                print(f"  {k}: {v:.4f}")
+    except Exception as e:  # noqa: BLE001
+        print(f"Warning: cell-eval failed ({e}); pred/real h5ads are written for manual eval.")
 
 
 if __name__ == "__main__":
