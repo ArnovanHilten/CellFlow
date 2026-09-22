@@ -99,6 +99,10 @@ def parse_args():
     p.add_argument("--wandb_tags", default="")
     p.add_argument("--eval_num_threads", type=int, default=32)
 
+    # Skip training; load the saved CellFlow.pkl and only (re)evaluate. Use this to
+    # score already-trained grid models on the VALIDATION split for model selection.
+    p.add_argument("--eval_only", action="store_true")
+
     return p.parse_args()
 
 
@@ -130,6 +134,107 @@ def _load_gene_id_map(path):
         m = m.sort_values("gene_type", key=lambda s: s.eq("protein_coding"))
     vals = m[val_col].astype(str).str.split(".").str[0]
     return dict(zip(m[key_col].astype(str), vals, strict=False))
+
+
+def evaluate_split(cf, adata_split, split_name, save_path, args,
+                   is_embedding_mode, state_decoder, state_decoder_gene_idx, func_cfg):
+    """Predict + decode a split, write pred/real h5ads, run cell-eval -> final_<split>/.
+
+    Writes metrics for `split_name` ('val' or 'test'). Selection should use 'val';
+    'test' is for final reporting only.
+    """
+    import json as _json
+    import subprocess
+
+    if adata_split is None or not (~adata_split.obs["is_control"]).any():
+        print(f"No {split_name} perturbations; skipping {split_name} eval.")
+        return
+    out = os.path.join(save_path, f"final_{split_name}")
+    os.makedirs(out, exist_ok=True)
+
+    pert = adata_split.obs.loc[~adata_split.obs["is_control"], ["condition", args.cell_type_key]].drop_duplicates()
+    covariate_df = pd.DataFrame({
+        "condition": pert["condition"].values,
+        args.cell_type_key: pert[args.cell_type_key].values,
+        "is_control": False,
+        "condition_name": [f"{c}|{ct}" for c, ct in zip(pert["condition"], pert[args.cell_type_key], strict=False)],
+    })
+    # multi_stream duplicates the gene column per source (condition__<src>).
+    if func_cfg is not None:
+        for cols in func_cfg.perturbation_covariates.values():
+            for col in cols:
+                if col not in covariate_df.columns:
+                    covariate_df[col] = covariate_df["condition"].values
+
+    control_cells = adata_split[adata_split.obs["is_control"]].copy()
+    predictions = cf.predict(adata=control_cells, covariate_data=covariate_df,
+                             sample_rep="X_pca", condition_id_key="condition_name")
+
+    def _decode(x):
+        return reconstruct_from_pca(x, adata_split, state_decoder=state_decoder,
+                                    state_decoder_gene_idx=state_decoder_gene_idx)
+
+    def _real(cells):
+        # ground truth in the SAME space _decode() outputs: obsm[embed_key] for the
+        # X_hvg (PCA-inverse) path, gene-space .X for the X_state (decoder) path.
+        if is_embedding_mode:
+            X = cells.X
+            return np.asarray(X.toarray() if hasattr(X, "toarray") else X)
+        return np.asarray(cells.obsm[args.embed_key])
+
+    pred_expr, pred_names, real_expr, real_names = [], [], [], []
+    pred_expr.append(_decode(control_cells.obsm["X_pca"]))
+    pred_names += ["control"] * pred_expr[-1].shape[0]
+    real_expr.append(_real(control_cells))
+    real_names += ["control"] * real_expr[-1].shape[0]
+
+    skipped = []
+    for _, row in covariate_df.iterrows():
+        key = row["condition_name"]
+        if key not in predictions:
+            skipped.append(key)
+            continue
+        pred_expr.append(_decode(predictions[key]))
+        pred_names += [row["condition"]] * pred_expr[-1].shape[0]
+        rc = adata_split[(adata_split.obs["condition"] == row["condition"]) &
+                         (adata_split.obs[args.cell_type_key] == row[args.cell_type_key])]
+        real_expr.append(_real(rc))
+        real_names += [row["condition"]] * real_expr[-1].shape[0]
+
+    pred_path = os.path.join(out, "pred.h5ad")
+    real_path = os.path.join(out, "real.h5ad")
+    ad.AnnData(X=np.concatenate(pred_expr).astype(np.float32),
+               obs=pd.DataFrame({"perturbation": pred_names})).write_h5ad(pred_path)
+    ad.AnnData(X=np.concatenate(real_expr).astype(np.float32),
+               obs=pd.DataFrame({"perturbation": real_names})).write_h5ad(real_path)
+    if skipped:
+        print(f"  [{split_name}] {len(skipped)} conditions not returned by predict() were skipped.")
+
+    results_csv = os.path.join(out, "results.csv")
+    agg_csv = os.path.join(out, "agg_results.csv")
+    eval_script = f"""
+import anndata as ad, json
+from cell_eval import MetricsEvaluator
+pred = ad.read_h5ad({_json.dumps(pred_path)})
+real = ad.read_h5ad({_json.dumps(real_path)})
+ev = MetricsEvaluator(adata_pred=pred, adata_real=real, control_pert="control",
+                      pert_col="perturbation", num_threads={args.eval_num_threads})
+results, agg = ev.compute()
+results.write_csv({_json.dumps(results_csv)})
+agg.write_csv({_json.dumps(agg_csv)})
+"""
+    try:
+        proc = subprocess.run([sys.executable, "-c", eval_script], text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"cell-eval exited {proc.returncode}")
+        agg_df = pd.read_csv(agg_csv)
+        mean_row = agg_df[agg_df["statistic"] == "mean"].iloc[0].to_dict()
+        print(f"[{split_name}] metrics (mean across perturbations):")
+        for k, v in mean_row.items():
+            if isinstance(v, float):
+                print(f"  {k}: {v:.4f}")
+    except Exception as e:  # noqa: BLE001
+        print(f"Warning: [{split_name}] cell-eval failed ({e}); pred/real h5ads written for manual eval.")
 
 
 def main():
@@ -255,192 +360,107 @@ def main():
         pert_kwargs = {"perturbation_covariates": {"gene": ["condition"]},
                        "perturbation_covariate_reps": {"gene": "gene_emb"}}
 
-    cf = CellFlow(adata_train, solver="otfm")
-    cf.prepare_data(
-        sample_rep="X_pca",
-        control_key="is_control",
-        split_covariates=[args.cell_type_key],
-        max_combination_length=1,
-        **pert_kwargs,
-    )
-    if adata_val is not None and (~adata_val.obs["is_control"]).any():
-        val_conds = sorted(set(adata_val.obs.loc[~adata_val.obs["is_control"], "condition"]))
-        cf.prepare_validation_data(adata_val, name="val",
-                                   n_conditions_on_log_iteration=min(50, len(val_conds)))
-
-    dims = tuple([args.hidden_dim] * args.n_hidden_layers)
-    model_kwargs = {}
-    if func_cfg is not None and func_cfg.fusion == "multi_stream":
-        model_kwargs["layers_before_pool"] = func_cfg.layers_before_pool()
-    cf.prepare_model(
-        condition_embedding_dim=args.condition_embedding_dim,
-        hidden_dims=dims, decoder_dims=dims, time_encoder_dims=dims,
-        pooling="attention_token", optimizer=optax.adam(args.lr),
-        **model_kwargs,
-    )
-
-    callbacks = [Metrics(metrics=["r_squared", "e_distance", "mmd"])]
-
     has_val = adata_val is not None and (~adata_val.obs["is_control"]).any()
 
-    # Best-checkpoint on the validation set: training loss → 0 while held-out R²
-    # degrades (overfitting), so we keep the inference params from the iteration
-    # with the highest val_r_squared_mean instead of the last ones. Subclasses
-    # Metrics so it computes the same value itself (order-independent) and snapshots
-    # solver.vf_state_inference.params (what predict uses) to host memory.
-    best_ckpt = None
-    if has_val:
-        class BestValCheckpoint(Metrics):
-            def __init__(self):
-                super().__init__(metrics=["r_squared"])
-                self.best = None
-                self.best_params = None
-                self.best_iter = -1
-                self._n = 0
-
-            def _maybe_update(self, vs, vt, vp, solver):
-                out = super().on_log_iteration(vs, vt, vp, solver)
-                self._n += 1
-                v = out.get("val_r_squared_mean")
-                if v is None or v != v:  # missing / NaN
-                    return
-                if self.best is None or v > self.best:
-                    self.best = float(v)
-                    self.best_iter = self._n
-                    self.best_params = jax.device_get(solver.vf_state_inference.params)
-
-            def on_log_iteration(self, vs, vt, vp, solver):
-                self._maybe_update(vs, vt, vp, solver)
-                return {}
-
-            def on_train_end(self, vs, vt, vp, solver):
-                self._maybe_update(vs, vt, vp, solver)
-                return {}
-
-        best_ckpt = BestValCheckpoint()
-        callbacks.append(best_ckpt)
-
-    if args.wandb_project:
-        from cellflow.training import WandbLogger
-
-        tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
-        callbacks.append(WandbLogger(project=args.wandb_project, out_dir=save_path,
-                                     config=vars(args), entity=args.wandb_entity or None,
-                                     name=args.run_id or os.path.basename(save_path), tags=tags))
-
-    cf.train(num_iterations=args.num_iterations, batch_size=args.batch_size,
-             valid_freq=args.valid_freq, callbacks=callbacks,
-             monitor_metrics=["val_r_squared_mean"] if has_val else [])
-
-    # Restore the best-validation inference params (predict/eval + save use them).
-    if best_ckpt is not None and best_ckpt.best_params is not None:
-        import jax.numpy as jnp
-
-        cf.solver.vf_state_inference = cf.solver.vf_state_inference.replace(
-            params=jax.tree_util.tree_map(jnp.asarray, best_ckpt.best_params)
+    if args.eval_only:
+        # Re-score an already-trained model (e.g. to add validation metrics to a
+        # finished grid). No training; the saved model already holds the best params.
+        cf = CellFlow.load(save_path)
+        print(f"[eval_only] loaded trained model from {save_path}/CellFlow.pkl")
+    else:
+        cf = CellFlow(adata_train, solver="otfm")
+        cf.prepare_data(
+            sample_rep="X_pca",
+            control_key="is_control",
+            split_covariates=[args.cell_type_key],
+            max_combination_length=1,
+            **pert_kwargs,
         )
-        print(f"Restored best val_r_squared_mean={best_ckpt.best:.4f} "
-              f"(validation #{best_ckpt.best_iter}) for eval/save.")
-    cf.save(save_path, overwrite=True)
-    print(f"Model saved to {save_path}/CellFlow.pkl")
+        if has_val:
+            val_conds = sorted(set(adata_val.obs.loc[~adata_val.obs["is_control"], "condition"]))
+            cf.prepare_validation_data(adata_val, name="val",
+                                       n_conditions_on_log_iteration=min(50, len(val_conds)))
 
-    # ── 6. Predict + decode on TEST, write pred/real h5ads ────────────────────
-    if adata_test is None or not (~adata_test.obs["is_control"]).any():
-        print("No test perturbations; skipping final eval.")
-        return
-    final_path = os.path.join(save_path, "final_test")
-    os.makedirs(final_path, exist_ok=True)
+        dims = tuple([args.hidden_dim] * args.n_hidden_layers)
+        model_kwargs = {}
+        if func_cfg is not None and func_cfg.fusion == "multi_stream":
+            model_kwargs["layers_before_pool"] = func_cfg.layers_before_pool()
+        cf.prepare_model(
+            condition_embedding_dim=args.condition_embedding_dim,
+            hidden_dims=dims, decoder_dims=dims, time_encoder_dims=dims,
+            pooling="attention_token", optimizer=optax.adam(args.lr),
+            **model_kwargs,
+        )
 
-    # unique (condition, cell_type) pairs among perturbed test cells
-    pert_test = adata_test.obs.loc[~adata_test.obs["is_control"], ["condition", args.cell_type_key]].drop_duplicates()
-    covariate_df = pd.DataFrame({
-        "condition": pert_test["condition"].values,
-        args.cell_type_key: pert_test[args.cell_type_key].values,
-        "is_control": False,
-        "condition_name": [f"{c}|{ct}" for c, ct in zip(pert_test["condition"], pert_test[args.cell_type_key], strict=False)],
-    })
-    # multi_stream fusion duplicates the gene column per source (condition__<src>);
-    # the prediction covariate_df must carry those columns too (same gene value).
-    if func_cfg is not None:
-        for cols in func_cfg.perturbation_covariates.values():
-            for col in cols:
-                if col not in covariate_df.columns:
-                    covariate_df[col] = covariate_df["condition"].values
-    control_cells = adata_test[adata_test.obs["is_control"]].copy()
-    predictions = cf.predict(adata=control_cells, covariate_data=covariate_df,
-                             sample_rep="X_pca", condition_id_key="condition_name")
+        callbacks = [Metrics(metrics=["r_squared", "e_distance", "mmd"])]
 
-    def _decode(X_pca):
-        return reconstruct_from_pca(X_pca, adata_test, state_decoder=state_decoder,
-                                    state_decoder_gene_idx=state_decoder_gene_idx)
+        # Best-checkpoint on the validation set: training loss → 0 while held-out R²
+        # degrades (overfitting), so we keep the inference params from the iteration
+        # with the highest val_r_squared_mean instead of the last ones. Subclasses
+        # Metrics so it computes the same value itself (order-independent) and snapshots
+        # solver.vf_state_inference.params (what predict uses) to host memory.
+        best_ckpt = None
+        if has_val:
+            class BestValCheckpoint(Metrics):
+                def __init__(self):
+                    super().__init__(metrics=["r_squared"])
+                    self.best = None
+                    self.best_params = None
+                    self.best_iter = -1
+                    self._n = 0
 
-    def _real(cells):
-        # ground truth in the SAME space _decode() outputs: obsm[embed_key] for the
-        # X_hvg (PCA-inverse) path, gene-space .X for the X_state (decoder) path.
-        if is_embedding_mode:
-            X = cells.X
-            return np.asarray(X.toarray() if hasattr(X, "toarray") else X)
-        return np.asarray(cells.obsm[args.embed_key])
+                def _maybe_update(self, vs, vt, vp, solver):
+                    out = super().on_log_iteration(vs, vt, vp, solver)
+                    self._n += 1
+                    v = out.get("val_r_squared_mean")
+                    if v is None or v != v:  # missing / NaN
+                        return
+                    if self.best is None or v > self.best:
+                        self.best = float(v)
+                        self.best_iter = self._n
+                        self.best_params = jax.device_get(solver.vf_state_inference.params)
 
-    pred_expr, pred_names, real_expr, real_names = [], [], [], []
-    # control baseline (needed by cell-eval, which computes effects relative to control)
-    pred_expr.append(_decode(control_cells.obsm["X_pca"]))
-    pred_names += ["control"] * pred_expr[-1].shape[0]
-    real_expr.append(_real(control_cells))
-    real_names += ["control"] * real_expr[-1].shape[0]
+                def on_log_iteration(self, vs, vt, vp, solver):
+                    self._maybe_update(vs, vt, vp, solver)
+                    return {}
 
-    skipped = []
-    for _, row in covariate_df.iterrows():
-        key = row["condition_name"]
-        if key not in predictions:
-            skipped.append(key)
-            continue
-        pred_expr.append(_decode(predictions[key]))
-        pred_names += [row["condition"]] * pred_expr[-1].shape[0]
-        rc = adata_test[(adata_test.obs["condition"] == row["condition"]) &
-                        (adata_test.obs[args.cell_type_key] == row[args.cell_type_key])]
-        real_expr.append(_real(rc))
-        real_names += [row["condition"]] * real_expr[-1].shape[0]
+                def on_train_end(self, vs, vt, vp, solver):
+                    self._maybe_update(vs, vt, vp, solver)
+                    return {}
 
-    pred_path = os.path.join(final_path, "pred.h5ad")
-    real_path = os.path.join(final_path, "real.h5ad")
-    ad.AnnData(X=np.concatenate(pred_expr).astype(np.float32),
-               obs=pd.DataFrame({"perturbation": pred_names})).write_h5ad(pred_path)
-    ad.AnnData(X=np.concatenate(real_expr).astype(np.float32),
-               obs=pd.DataFrame({"perturbation": real_names})).write_h5ad(real_path)
-    if skipped:
-        print(f"  {len(skipped)} test conditions not returned by predict() were skipped.")
-    print(f"Wrote pred/real to {final_path}")
+            best_ckpt = BestValCheckpoint()
+            callbacks.append(best_ckpt)
 
-    # ── 7. cell-eval metrics (subprocess: pdex forks, which deadlocks with JAX) ──
-    import json as _json
-    import subprocess
+        if args.wandb_project:
+            from cellflow.training import WandbLogger
 
-    results_csv = os.path.join(final_path, "results.csv")
-    agg_csv = os.path.join(final_path, "agg_results.csv")
-    eval_script = f"""
-import anndata as ad, json
-from cell_eval import MetricsEvaluator
-pred = ad.read_h5ad({_json.dumps(pred_path)})
-real = ad.read_h5ad({_json.dumps(real_path)})
-ev = MetricsEvaluator(adata_pred=pred, adata_real=real, control_pert="control",
-                      pert_col="perturbation", num_threads={args.eval_num_threads})
-results, agg = ev.compute()
-results.write_csv({_json.dumps(results_csv)})
-agg.write_csv({_json.dumps(agg_csv)})
-"""
-    try:
-        proc = subprocess.run([sys.executable, "-c", eval_script], text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"cell-eval exited {proc.returncode}")
-        agg_df = pd.read_csv(agg_csv)
-        mean_row = agg_df[agg_df["statistic"] == "mean"].iloc[0].to_dict()
-        print("Test metrics (mean across perturbations):")
-        for k, v in mean_row.items():
-            if isinstance(v, float):
-                print(f"  {k}: {v:.4f}")
-    except Exception as e:  # noqa: BLE001
-        print(f"Warning: cell-eval failed ({e}); pred/real h5ads are written for manual eval.")
+            tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+            callbacks.append(WandbLogger(project=args.wandb_project, out_dir=save_path,
+                                         config=vars(args), entity=args.wandb_entity or None,
+                                         name=args.run_id or os.path.basename(save_path), tags=tags))
+
+        cf.train(num_iterations=args.num_iterations, batch_size=args.batch_size,
+                 valid_freq=args.valid_freq, callbacks=callbacks,
+                 monitor_metrics=["val_r_squared_mean"] if has_val else [])
+
+        # Restore the best-validation inference params (predict/eval + save use them).
+        if best_ckpt is not None and best_ckpt.best_params is not None:
+            import jax.numpy as jnp
+
+            cf.solver.vf_state_inference = cf.solver.vf_state_inference.replace(
+                params=jax.tree_util.tree_map(jnp.asarray, best_ckpt.best_params)
+            )
+            print(f"Restored best val_r_squared_mean={best_ckpt.best:.4f} "
+                  f"(validation #{best_ckpt.best_iter}) for eval/save.")
+        cf.save(save_path, overwrite=True)
+        print(f"Model saved to {save_path}/CellFlow.pkl")
+
+    # ── 6. Evaluate BOTH splits: validation (for model selection) and test ──────
+    #    Select hyperparameters on final_val/, report the chosen config on final_test/.
+    evaluate_split(cf, adata_val, "val", save_path, args, is_embedding_mode,
+                   state_decoder, state_decoder_gene_idx, func_cfg)
+    evaluate_split(cf, adata_test, "test", save_path, args, is_embedding_mode,
+                   state_decoder, state_decoder_gene_idx, func_cfg)
 
 
 if __name__ == "__main__":
